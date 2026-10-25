@@ -15,7 +15,13 @@ const (
 	TypePong             uint8 = 0x02
 	TypeFindNodeRequest  uint8 = 0x03
 	TypeFindNodeResponse uint8 = 0x04
-	TypeError            uint8 = 0x7F
+
+	TypeStoreRequest      uint8 = 0x05
+	TypeStoreResponse     uint8 = 0x06
+	TypeFindValueRequest  uint8 = 0x07
+	TypeFindValueResponse uint8 = 0x08
+
+	TypeError uint8 = 0x7F
 )
 
 var (
@@ -44,7 +50,6 @@ func (f *Frame) Marshal() []byte {
 	return buf
 }
 
-// ReadFrame читает ровно один кадр
 func ReadFrame(r io.Reader, protoVersion uint8, maxPayload int) (*Frame, error) {
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -74,7 +79,6 @@ func ReadFrame(r io.Reader, protoVersion uint8, maxPayload int) (*Frame, error) 
 	return f, nil
 }
 
-// FrameDecoder инкрементально разбирает поток на кадры
 type FrameDecoder struct {
 	r            io.Reader
 	protoVersion uint8

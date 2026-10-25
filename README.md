@@ -1,18 +1,23 @@
 # seti-p2p
 
 Узел децентрализованной оверлейной P2P-сети поверх TCP/IP с
-криптографической идентичностью, таблицей маршрутизации Kademlia и
-итеративным поиском узлов.
+криптографической идентичностью, таблицей маршрутизации Kademlia,
+итеративным поиском узлов и подписанными записями DHT.
 
 **Курсовая работа:** «Защищённая оверлейная сеть передачи данных на
 основе пиринговых протоколов».
-**Текущий статус:** этапы 1–2 завершены (транспорт, кадрирование,
-идентичность, Kademlia DHT, bootstrap, `PING`, `FIND_NODE`).
-**Уровень:** продвинутый (`N=20`, `K=4`, четыре bootstrap-схемы).
+**Текущий статус:** этапы 1–3 завершены (транспорт, кадрирование,
+идентичность, Kademlia DHT, bootstrap, `PING`, `FIND_NODE`, `STORE`,
+`FIND_VALUE`, подписанные `NodeRecord`, репликация `R = 3`, TTL,
+переопубликование, псевдонимы).
+**Уровень:** продвинутый (`N = 20`, `K = 4`, `R = 3`, четыре
+bootstrap-схемы).
 
 ---
 
 ## 1. Что реализовано
+
+### Этапы 1–2
 
 - TCP-сервер и клиент с собственным кадрированием (24-байтовый заголовок).
 - Строгая JSON-сериализация payload с `DisallowUnknownFields`.
@@ -29,13 +34,28 @@
 - Серия контрольных lookup и сбор метрик в CSV.
 - Сравнение форматов сериализации JSON / MessagePack / CBOR.
 
-### Что НЕ реализовано (границы этапов 1–2)
+### Этап 3
 
-- `STORE` / `FIND_VALUE` и подписанные `NodeRecord` (этап 3).
+- Подписанные `NodeRecord` с каноническим представлением
+  (`seti-p2p/record/v1`) и Ed25519-подписью.
+- Локальное хранилище DHT с персистентностью в `state_dir/dht-store.json`.
+- `STORE` / `FIND_VALUE` как RPC в кадре версии 1 (`0x05–0x08`).
+- Репликация `R = 3`: владелец + до двух удалённых хранителей;
+  успех при `acks >= 2`.
+- TTL записей, очистка истёкших, защита от отката `sequence_number`.
+- Переопубликование владельцем раз в `TTL/2` с пересборкой записи.
+- Псевдонимы с нормализацией и детерминированным DHT-ключом
+  `SHA-256("alias:" || normalized)`.
+- Сценарий отказа именно хранителя (`scripts/store_experiment.sh`).
+
+### Что НЕ реализовано (границы этапов 1–3)
+
 - TLS 1.3 / AKE и end-to-end шифрование (этап 4).
 - Туннельная ретрансляция (этап 5).
 - Прикладные сообщения и передача файлов (этап 5).
 - Защита от Sybil/Eclipse за пределами ограниченности k-bucket.
+- Глобальная согласованность записей (quorum, vector clock, anti-entropy).
+- NAT traversal.
 
 ---
 
@@ -48,7 +68,7 @@
   `date +%s%N`.
 - (Опционально) **OpenSSL** — для внешней проверки сертификатов.
 - (Опционально) **Docker** и **docker-compose** — не используются на
-  этапах 1–2, но заготовлены для будущих этапов.
+  этапах 1–3, но заготовлены для будущих этапов.
 
 ---
 
@@ -70,7 +90,7 @@ go test ./tests/unit/... -v
 go test ./tests/integration/... -v
 ```
 
-Ожидаемый результат: **31 unit-тестов** и **2 integration-тест**
+Ожидаемый результат: **68 unit-тестов** и **24 integration-теста**
 проходят без ошибок.
 
 ---
@@ -172,6 +192,40 @@ SCHEME=star NODES=20 ./scripts/check_non_degenerate.sh
 Результаты: `results/serialization-sizes.txt`,
 `results/serialization-bench.txt`.
 
+### 5.5. Эксперимент `STORE` / `FIND_VALUE`
+
+```bash
+# Одна схема
+NODES=20 K=4 SCHEME=star RUNS=50 KILL_REPLICA=1 ./scripts/store_experiment.sh
+
+# Все четыре схемы
+for s in star ring tree multi-seed; do
+  NODES=20 K=4 SCHEME=$s RUNS=50 KILL_REPLICA=1 ./scripts/store_experiment.sh
+done
+```
+
+Скрипт:
+
+1. Поднимает сеть `N = 20`.
+2. Каждый узел публикует свою запись через `-publish-self`.
+3. Собирает ключи из логов.
+4. При `KILL_REPLICA=1` находит в логе `store put` список
+   подтвердивших (`stored_at`) и убивает **именно хранителя**
+   (не владельца и не `node-01`). Жертва выбирается только среди
+   ключей, у которых `stored_at` содержит ровно три shortID
+   (`acks = 3`): после отказа остаётся хотя бы один живой
+   удалённый хранитель.
+5. Для каждого прогона поднимает reader-узел с `-get-key`,
+   bootstrap через три первых узла (чтобы отказ хранителя не
+   блокировал bootstrap).
+6. Собирает CSV: `run,initiator,target_key,is_victim_key,success,seq,rpcs,iters,duration_ms`.
+7. Печатает в summary строку
+   `victim_key=<short> reads=<N> success=<M>` — прямое
+   подтверждение E3-5 из сырых данных.
+
+Результаты: `results/<scheme>-store.csv`,
+`results/<scheme>-store.txt`.
+
 ---
 
 ## 6. Конфигурация
@@ -192,13 +246,14 @@ SCHEME=star NODES=20 ./scripts/check_non_degenerate.sh
   "ping_timeout_ms": 5000,
   "max_frame_payload": 65536,
   "protocol_version": 1,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "ttl_seconds": 180
 }
 ```
 
 | Параметр | Смысл |
 |---|---|
-| `state_dir` | Каталог состояния узла (ключи, логи, маркеры) |
+| `state_dir` | Каталог состояния узла (ключи, логи, маркеры, `dht-store.json`) |
 | `listen_host`, `listen_port` | Адрес TCP-сервера |
 | `bootstrap_peers` | Начальные контакты; пустой список — только для seed |
 | `k_bucket_size` | Ёмкость одного k-bucket |
@@ -208,10 +263,11 @@ SCHEME=star NODES=20 ./scripts/check_non_degenerate.sh
 | `ping_timeout_ms` | Таймаут ожидания `PONG` |
 | `max_frame_payload` | Максимальный размер payload (65536) |
 | `protocol_version` | Версия протокола (1) |
+| `ttl_seconds` | TTL записи DHT; переопубликование раз в `TTL/2` |
 
 Готовые конфиги для экспериментов генерируются автоматически
-скриптами `scripts/demo.sh` и `scripts/lookup.sh` в каталоге
-`state-<scheme>/configs/`.
+скриптами `scripts/demo.sh`, `scripts/lookup.sh`,
+`scripts/store_experiment.sh` в каталоге `state-<scheme>/configs/`.
 
 ### Переопределение через переменные окружения
 
@@ -222,6 +278,7 @@ export SETI_LISTEN_PORT=9101
 export SETI_BOOTSTRAP_PEERS=127.0.0.1:9101,127.0.0.1:9102
 export SETI_K_BUCKET_SIZE=4
 export SETI_ALPHA=3
+export SETI_TTL_SECONDS=180
 ```
 
 ---
@@ -242,6 +299,10 @@ export SETI_ALPHA=3
 | `-ready-file` | Файл-маркер готовности |
 | `-lookup` | Hex `NodeID` для запуска `FIND_NODE` после bootstrap |
 | `-boot-delay` | Задержка перед bootstrap (по умолчанию `200ms`) |
+| `-publish-self` | Построить и опубликовать свою запись через `Put` |
+| `-put-record` | Hex-encoded JSON `NodeRecord` для публикации |
+| `-get-key` | Hex DHT-ключ для `FIND_VALUE` |
+| `-get-alias` | Псевдоним для `GetAlias` |
 
 Пример:
 
@@ -284,18 +345,23 @@ seti-p2p/
 ├── docs/
 │   ├── Architecture.md           # архитектура и инженерные решения
 │   ├── Protocol.md               # спецификация протокола
+│   ├── Node record.md            # формат подписанной адресной записи
 │   ├── Serialization comparison.md # сравнение JSON / MsgPack / CBOR
 │   └── sprints/
 │       ├── 1.md                  # отчёт по этапу 1
-│       └── 2.md                  # отчёт по этапу 2
+│       ├── 2.md                  # отчёт по этапу 2
+│       └── 3.md                  # отчёт по этапу 3
 ├── internal/
 │   ├── config/                   # парсинг конфига + env
 │   ├── identity/                 # Ed25519, NodeID
 │   ├── protocol/                 # кадр, типы, JSON-кодеки, бенчмарки
 │   ├── routing/                  # Contact, XOR, k-bucket, RoutingTable
 │   ├── transport/                # TCP, RPC-клиент
-│   ├── dht/                      # итеративный FIND_NODE lookup
-│   ├── node/                     # узел: сервер, PING, FIND_NODE, bootstrap
+│   ├── dht/                      # lookup.go, find_value.go
+│   ├── store/                    # record.go, store.go
+│   ├── node/                     # узел: сервер, PING/FIND_NODE/STORE/FIND_VALUE,
+│   │                             # bootstrap, observe, Lookup,
+│   │                             # Put/Get/PutAlias/GetAlias, republish
 │   ├── security/                 # резерв под этап 4
 │   ├── tunnel/                   # резерв под этап 5
 │   ├── application/              # резерв под этап 5
@@ -305,10 +371,11 @@ seti-p2p/
 │   ├── demo.sh                   # запуск сети + lookup + seed failure
 │   ├── lookup.sh                 # серия контрольных lookup + CSV
 │   ├── bench.sh                  # сравнение форматов сериализации
-│   └── check_non_degenerate.sh   # проверка невырожденности DHT
+│   ├── check_non_degenerate.sh   # проверка невырожденности DHT
+│   └── store_experiment.sh       # STORE / FIND_VALUE + отказ хранителя
 ├── tests/
 │   ├── unit/                     # unit-тесты
-│   └── integration/              # интеграционный тест
+│   └── integration/              # интеграционные тесты
 ├── .gitignore
 ├── go.mod
 ├── go.sum
@@ -338,9 +405,13 @@ go test ./tests/unit/... -v
   `Remove`;
 - `RoutingTable`: полный bucket с живым LRU (`Promote`), полный bucket
   с мёртвым LRU (`ReplaceIfDead`), отклонение self-контакта,
-  `TouchVerified`.
+  `TouchVerified`;
+- `NodeRecord`: канонизация, подпись, `Validate` (включая TTL,
+  адреса, `sequence_number`, ненормализованный alias),
+  `NormalizeAlias`, `AliasKey`;
+- локальное хранилище: `Put`/`Get`, откат версии, TTL, персистентность.
 
-Итого **31 unit-тестов**.
+Итого **68 unit-тестов**.
 
 ### Integration-тесты
 
@@ -348,11 +419,24 @@ go test ./tests/unit/... -v
 go test ./tests/integration/... -v
 ```
 
-`TestBootstrapAndLookup` — пять узлов, bootstrap через seed, lookup
-через промежуточный узел.
+Покрывают:
 
-`TestSeedFailureDoesNotBlockLookup` — пять узлов, отказ seed, lookup
-между двумя клиентами после отказа.
+- `TestBootstrapAndLookup` — пять узлов, bootstrap через seed, lookup
+  через промежуточный узел;
+- `TestSeedFailureDoesNotBlockLookup` — пять узлов, отказ seed, lookup
+  между двумя клиентами после отказа;
+- `TestStoreThenFindValue`, `TestFindValueMissReturnsContacts` —
+  `STORE`/`FIND_VALUE` на двух-трёх узлах;
+- `TestStoreRejectsRollbackOverNetwork`, `TestStorePersistsAcrossRestart`;
+- `TestPutThenGetAcrossNodes`, `TestGetAfterReplicaFailure`,
+  `TestPutLocalOnlyOnThreeNodes`, `TestPutReplicasCountsOwner` —
+  `Put`/`Get` на четырёх узлах, отказ хранителя, семантика `Replicas`;
+- `TestPutAliasThenGetByAlias`, `TestAliasLastWriterWins`,
+  `TestPutAliasRejects*`, `TestPutAliasRejectsInvalidRecord`,
+  `TestPutAliasRejectsInvalidAddress`, `TestGetAlias*` — псевдонимы;
+- `TestRepublishExtendsTTL` — переопубликование.
+
+Итого **24 integration-теста**.
 
 ### Бенчмарки
 
@@ -371,14 +455,17 @@ go test ./... -count=1
 ## 11. Документация
 
 - **`docs/Architecture.md`** — модульная структура, слои, ключевые
-  инженерные решения, ограничения, задел на этапы 3–5.
+  инженерные решения, ограничения, задел на этапы 4–5.
 - **`docs/Protocol.md`** — формат кадра, типы сообщений, схемы payload,
   правила `NodeID`, устройство `RoutingTable`, алгоритм lookup,
-  схемы bootstrap.
+  схемы bootstrap, `STORE`/`FIND_VALUE`, `NodeRecord`.
+- **`docs/Node record.md`** — формат подписанной адресной записи,
+  канонизация, подпись, TTL, псевдонимы, ограничения модели.
 - **`docs/Serialization comparison.md`** — сравнение JSON, MessagePack,
   CBOR с числами по размеру, скорости и аллокациям.
-- **`docs/sprints/1.md`**, **`docs/sprints/2.md`** — отчёты по этапам
-  с таблицами «требование → где реализовано».
+- **`docs/sprints/1.md`**, **`docs/sprints/2.md`**,
+  **`docs/sprints/3.md`** — отчёты по этапам с таблицами
+  «требование → где реализовано».
 
 ---
 
@@ -412,26 +499,65 @@ go test ./... -count=1
 
 ---
 
-## 13. Ограничения
+## 13. Результаты этапа 3
+
+### `store_experiment.sh` на `N=20, K=4, R=3, KILL_REPLICA=1, RUNS=50`
+
+| Схема | Success | avg rpcs | avg iters | avg duration | median duration | `victim_key` reads / success | `non_victim` reads / success |
+|---|---:|---:|---:|---:|---:|---|---|
+| `star` | 39/50 | 6.31 | 2.10 | 1.21 ms | 1.00 ms | 28 / 23 (82%) | 22 / 16 |
+| `ring` | 44/50 | 6.68 | 2.41 | 1.34 ms | 1.00 ms | 25 / 25 (100%) | 25 / 19 |
+| `tree` | 38/50 | 6.55 | 2.18 | 1.26 ms | 1.00 ms | 25 / 18 (72%) | 25 / 20 |
+| `multi-seed` | 42/50 | 7.60 | 2.55 | 1.55 ms | 2.00 ms | 25 / 25 (100%) | 25 / 17 |
+
+Столбец `is_victim_key` в CSV (`1`, если `target_key == VICTIM_KEY`)
+позволяет автоматически подсчитать, сколько раз читался ключ убитого
+хранителя и сколько из этих чтений были успешными. В summary
+печатается строка `victim_key=<short> reads=<N> success=<M>`.
+
+### `TestRepublishExtendsTTL`
+
+`TTL = 4 с`, `republishInterval = 2 с`. Через 5 секунд после
+`PutLocal` запись жива, `ExpiresAt` сдвинут вперёд, `SequenceNumber`
+увеличен. Тест занимает ~5.0 секунды, при `go test -short`
+пропускается.
+
+### Псевдонимы
+
+- `PutAlias` / `GetAlias` на четырёх узлах: `alice` → `ALICE` → `alice`.
+- `TestAliasLastWriterWins` подтверждает локальный last-writer-wins
+  на стороне хранителя: `sequence_number` 1 → 2 вытесняет
+  предыдущую версию.
+- `PutAlias` отклоняет чужую запись (`ErrAliasNotOwn`), запись
+  с уже установленным `alias` (`ErrAliasAlreadySet`) и запись,
+  не прошедшую `Validate` (`alias: invalid record: …`).
+
+---
+
+## 14. Ограничения
 
 - **Loopback-развёртывание.** Нулевые задержки, отсутствие реальных
   сетевых эффектов. Метрики времени (1 мс) не переносятся на реальные
   сети без поправки.
 - **Нет TLS/AKE.** Публичный ключ передаётся в открытом виде, MITM
   возможен. Защищённый канал — предмет этапа 4.
+- **Нет глобальной согласованности.** Локальный last-writer-wins по
+  `sequence_number` на каждом хранителе; anti-entropy отсутствует.
+  Если `Put` не дошёл до хранителя, он не «догонит».
 - **Нет защиты от Sybil/Eclipse.** k-bucket ограничены, но массовое
-  заполнение не блокируется. За пределами этапов 1–2.
+  заполнение не блокируется. За пределами этапов 1–3.
+- **Нет защиты от захвата псевдонимов.** Любой узел может опубликовать
+  запись по любому ключу `SHA-256("alias:" || x)`.
 - **Нет NAT traversal.** Работает только в loopback/LAN.
 - **Случайность `NodeID`.** Каждый прогон генерирует новые ключи,
   поэтому структура XOR-распределения меняется. Учтено: серии из
-  30 lookup, выводы формулируются статистически.
+  50 наблюдений, выводы формулируются статистически.
 
 ---
 
-## 14. Дальнейшие этапы
+## 15. Дальнейшие этапы
 
-- **Этап 3.** `STORE` / `FIND_VALUE`, подписанные `NodeRecord`, TTL,
-  репликация `R=3`, переопубликование.
+- **Доработка 1-2 этапов.**
 - **Этап 4.** TLS 1.3 с mutual auth (упрощённый) или собственный AKE
   на Ed25519/X25519/HKDF/AEAD (продвинутый).
 - **Этап 5.** Туннельная ретрансляция (`TUNNEL_BUILD`, `TUNNEL_DATA`,

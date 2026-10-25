@@ -26,6 +26,7 @@ type Config struct {
 	MaxFramePayload  int       `json:"max_frame_payload"`
 	ProtocolVersion  uint8     `json:"protocol_version"`
 	LogLevel         string    `json:"log_level"`
+	TTLSeconds       int       `json:"ttl_seconds"`
 }
 
 func Default() Config {
@@ -40,6 +41,7 @@ func Default() Config {
 		MaxFramePayload:  65536,
 		ProtocolVersion:  1,
 		LogLevel:         "INFO",
+		TTLSeconds:       180,
 	}
 }
 
@@ -96,6 +98,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("SETI_ALPHA"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Alpha = n
+		}
+	}
+	if v := os.Getenv("SETI_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.TTLSeconds = n
 		}
 	}
 }

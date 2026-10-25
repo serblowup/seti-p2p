@@ -121,7 +121,6 @@ func ParsePublicKeyDER(der []byte) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
-// VerifyNodeID проверяет, что nodeID действительно соответствует publicKey
 func VerifyNodeID(nodeID []byte, pub ed25519.PublicKey) error {
 	want, err := NodeIDFromPublicKey(pub)
 	if err != nil {

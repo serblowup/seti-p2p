@@ -18,6 +18,6 @@ func LeadingBitIndex(dist *big.Int) int {
 	if dist.Sign() == 0 {
 		return -1
 	}
-	bitLen := dist.BitLen() // 1..256
+	bitLen := dist.BitLen()
 	return 256 - bitLen
 }

@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+
+	"seti-p2p/internal/store"
 )
 
 type ContactWire struct {
-	NodeID             []byte `json:"node_id"`
-	IdentityAlgorithm  string `json:"identity_algorithm"`
-	IdentityPublicKey  []byte `json:"identity_public_key"`
-	Host               string `json:"host"`
-	Port               uint16 `json:"port"`
+	NodeID            []byte `json:"node_id"`
+	IdentityAlgorithm string `json:"identity_algorithm"`
+	IdentityPublicKey []byte `json:"identity_public_key"`
+	Host              string `json:"host"`
+	Port              uint16 `json:"port"`
 }
 
 type PingPayload struct {
@@ -39,6 +41,28 @@ type FindNodeResponsePayload struct {
 type ErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type StoreRequestPayload struct {
+	Sender ContactWire      `json:"sender"`
+	Record store.NodeRecord `json:"record"`
+}
+
+type StoreResponsePayload struct {
+	Stored bool   `json:"stored"`
+	Error  string `json:"error,omitempty"`
+}
+
+type FindValueRequestPayload struct {
+	Sender ContactWire `json:"sender"`
+	Key    []byte      `json:"key"`
+}
+
+type FindValueResponsePayload struct {
+	Responder ContactWire        `json:"responder"`
+	Key       []byte             `json:"key"`
+	Record    *store.NodeRecord  `json:"record,omitempty"`
+	Contacts  []ContactWire      `json:"contacts,omitempty"`
 }
 
 func decodeStrict(b []byte, v any) error {
@@ -81,6 +105,30 @@ func DecodeFindNodeResponse(b []byte) (FindNodeResponsePayload, error) {
 
 func DecodeError(b []byte) (ErrorPayload, error) {
 	var p ErrorPayload
+	err := decodeStrict(b, &p)
+	return p, err
+}
+
+func DecodeStoreRequest(b []byte) (StoreRequestPayload, error) {
+	var p StoreRequestPayload
+	err := decodeStrict(b, &p)
+	return p, err
+}
+
+func DecodeStoreResponse(b []byte) (StoreResponsePayload, error) {
+	var p StoreResponsePayload
+	err := decodeStrict(b, &p)
+	return p, err
+}
+
+func DecodeFindValueRequest(b []byte) (FindValueRequestPayload, error) {
+	var p FindValueRequestPayload
+	err := decodeStrict(b, &p)
+	return p, err
+}
+
+func DecodeFindValueResponse(b []byte) (FindValueResponsePayload, error) {
+	var p FindValueResponsePayload
 	err := decodeStrict(b, &p)
 	return p, err
 }

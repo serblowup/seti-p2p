@@ -32,6 +32,7 @@ func startTestNode(t *testing.T) (*node.Node, string) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	t.Cleanup(func() { nd.Stop() })
 	if err := nd.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

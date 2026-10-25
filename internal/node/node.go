@@ -16,6 +16,7 @@ import (
 	"seti-p2p/internal/identity"
 	"seti-p2p/internal/protocol"
 	"seti-p2p/internal/routing"
+	"seti-p2p/internal/store"
 	"seti-p2p/internal/transport"
 )
 
@@ -24,6 +25,7 @@ type Node struct {
 	id     *identity.Identity
 	nodeID []byte
 	table  *routing.RoutingTable
+	store  *store.Store
 	ln     net.Listener
 
 	rpcClient transport.RPCClient
@@ -44,11 +46,18 @@ func New(cfg config.Config) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("node id: %w", err)
 	}
+
+	storePath := ""
+	if cfg.StateDir != "" {
+		storePath = filepath.Join(cfg.StateDir, "dht-store.json")
+	}
+
 	return &Node{
 		cfg:    cfg,
 		id:     id,
 		nodeID: nid,
 		table:  routing.NewRoutingTable(nid, cfg.KBucketSize),
+		store:  store.New(storePath),
 		rpcClient: transport.RPCClient{
 			ProtoVersion: cfg.ProtocolVersion,
 			MaxPayload:   cfg.MaxFramePayload,
@@ -64,6 +73,12 @@ func (n *Node) TableSize() int { return n.table.TotalContacts() }
 
 func (n *Node) TableNearest(target []byte, k int) []routing.Contact {
 	return n.table.Nearest(target, k)
+}
+
+func (n *Node) StoreSize() int { return n.store.Size() }
+
+func (n *Node) StoreGet(key []byte) (*store.NodeRecord, bool) {
+	return n.store.Get(key)
 }
 
 func (n *Node) SelfContact() (routing.Contact, error) {
@@ -90,6 +105,12 @@ func (n *Node) Start(ctx context.Context) error {
 		n.mu.Unlock()
 		return errors.New("node already started")
 	}
+
+	if err := n.store.LoadFromDisk(); err != nil {
+		n.mu.Unlock()
+		return fmt.Errorf("load dht-store: %w", err)
+	}
+
 	addr := net.JoinHostPort(n.cfg.ListenHost, itoa(n.cfg.ListenPort))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -101,20 +122,19 @@ func (n *Node) Start(ctx context.Context) error {
 	n.baseCtx = ctx
 	n.mu.Unlock()
 
-	log.Printf("node %s listening on %s (contacts=%d)",
-		shortID(n.nodeID), addr, n.table.TotalContacts())
-
-	go func() {
-		<-ctx.Done()
-		n.Stop()
-	}()
+	log.Printf("node %s listening on %s (contacts=%d, records=%d)",
+		shortID(n.nodeID), addr, n.table.TotalContacts(), n.store.Size())
 
 	go n.acceptLoop(ctx)
+	go n.runMaintenance(ctx)
 	return nil
 }
 
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
+		if err := n.store.SaveToDisk(); err != nil {
+			log.Printf("node %s: save dht-store: %v", shortID(n.nodeID), err)
+		}
 		n.mu.Lock()
 		ln := n.ln
 		n.mu.Unlock()
@@ -182,6 +202,10 @@ func (n *Node) dispatch(f *protocol.Frame) (*protocol.Frame, error) {
 		return n.handlePing(f)
 	case protocol.TypeFindNodeRequest:
 		return n.handleFindNode(f)
+	case protocol.TypeStoreRequest:
+		return n.handleStore(f)
+	case protocol.TypeFindValueRequest:
+		return n.handleFindValue(f)
 	default:
 		return nil, fmt.Errorf("unsupported message type 0x%02x", f.Type)
 	}

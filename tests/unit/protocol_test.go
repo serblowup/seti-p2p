@@ -2,9 +2,11 @@ package unit
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 
 	"seti-p2p/internal/protocol"
+	"seti-p2p/internal/store"
 )
 
 func sampleContactWire(id byte) protocol.ContactWire {
@@ -124,5 +126,142 @@ func TestDecodeRejectsEmpty(t *testing.T) {
 	}
 	if _, err := protocol.DecodeError([]byte{}); err == nil {
 		t.Fatalf("empty payload should be rejected")
+	}
+}
+
+func sampleNodeRecord(t *testing.T) store.NodeRecord {
+	t.Helper()
+	rec, _ := mkRecord(t, 1)
+	return *rec
+}
+
+func TestStoreRequestRoundTrip(t *testing.T) {
+	rec := sampleNodeRecord(t)
+	p := protocol.StoreRequestPayload{
+		Sender: sampleContactWire(1),
+		Record: rec,
+	}
+	b, err := protocol.EncodePayload(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := protocol.DecodeStoreRequest(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Record.SequenceNumber != rec.SequenceNumber {
+		t.Fatalf("seq mismatch")
+	}
+	if !bytes.Equal(got.Record.NodeID, rec.NodeID) {
+		t.Fatalf("node_id mismatch")
+	}
+	if len(got.Record.Signature) != len(rec.Signature) {
+		t.Fatalf("signature length mismatch")
+	}
+	if err := got.Record.Verify(); err != nil {
+		t.Fatalf("signature broken by round-trip: %v", err)
+	}
+}
+
+func TestStoreResponseRoundTrip(t *testing.T) {
+	p := protocol.StoreResponsePayload{Stored: true}
+	b, _ := protocol.EncodePayload(p)
+	got, err := protocol.DecodeStoreResponse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Stored {
+		t.Fatalf("Stored=false after round-trip")
+	}
+
+	p2 := protocol.StoreResponsePayload{Stored: false, Error: "rollback"}
+	b2, _ := protocol.EncodePayload(p2)
+	got2, err := protocol.DecodeStoreResponse(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.Stored || got2.Error != "rollback" {
+		t.Fatalf("error response mismatch")
+	}
+}
+
+func TestFindValueRequestRoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	key[0] = 0xab
+	p := protocol.FindValueRequestPayload{
+		Sender: sampleContactWire(2),
+		Key:    key,
+	}
+	b, _ := protocol.EncodePayload(p)
+	got, err := protocol.DecodeFindValueRequest(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Key, key) {
+		t.Fatalf("key mismatch")
+	}
+}
+
+func TestFindValueResponseRoundTripWithRecord(t *testing.T) {
+	rec := sampleNodeRecord(t)
+	key, _ := rec.Key()
+	p := protocol.FindValueResponsePayload{
+		Responder: sampleContactWire(3),
+		Key:       key,
+		Record:    &rec,
+	}
+	b, _ := protocol.EncodePayload(p)
+	got, err := protocol.DecodeFindValueResponse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Record == nil {
+		t.Fatal("record lost in round-trip")
+	}
+	if err := got.Record.Verify(); err != nil {
+		t.Fatalf("signature broken: %v", err)
+	}
+}
+
+func TestFindValueResponseRoundTripWithContacts(t *testing.T) {
+	key := make([]byte, 32)
+	p := protocol.FindValueResponsePayload{
+		Responder: sampleContactWire(3),
+		Key:       key,
+		Contacts: []protocol.ContactWire{
+			sampleContactWire(4),
+			sampleContactWire(5),
+		},
+	}
+	b, _ := protocol.EncodePayload(p)
+	got, err := protocol.DecodeFindValueResponse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Record != nil {
+		t.Fatal("record must be nil when not found")
+	}
+	if len(got.Contacts) != 2 {
+		t.Fatalf("contacts=%d, want 2", len(got.Contacts))
+	}
+}
+
+func TestDecodeRejectsUnknownFieldInRecord(t *testing.T) {
+	rec := sampleNodeRecord(t)
+	raw := []byte(`{
+		"sender": {"node_id":"","identity_algorithm":"","identity_public_key":"","host":"","port":0},
+		"record": {
+			"node_id":"` + hex.EncodeToString(rec.NodeID) + `",
+			"identity_public_key":"` + hex.EncodeToString(rec.IdentityPublicKey) + `",
+			"addresses":["127.0.0.1:9201"],
+			"sequence_number":1,
+			"issued_at":1,
+			"expires_at":2,
+			"signature":"` + hex.EncodeToString(rec.Signature) + `",
+			"extra_field":42
+		}
+	}`)
+	if _, err := protocol.DecodeStoreRequest(raw); err == nil {
+		t.Fatal("unknown field in record must be rejected")
 	}
 }
