@@ -20,16 +20,16 @@ CHECK_NONDEGEN=${CHECK_NONDEGEN:-1}
 
 case "$SCHEME" in
   star)
-    echo "==> scheme: star (all nodes bootstrap via node-01)"
+    echo "scheme: star"
     ;;
   ring)
-    echo "==> scheme: ring (node-i bootstraps via node-(i-1))"
+    echo "scheme: ring"
     ;;
   tree)
-    echo "==> scheme: tree (node-i bootstraps via node-(i/2))"
+    echo "scheme: tree"
     ;;
   multi-seed)
-    echo "==> scheme: multi-seed (${SEEDS} seeds chained; clients use 2 seeds each)"
+    echo "scheme: multi-seed"
     ;;
   *)
     echo "ERROR: unknown SCHEME='$SCHEME' (expected 'star', 'ring', 'tree', 'multi-seed')" >&2
@@ -50,7 +50,7 @@ fi
 rm -rf "$STATE"
 mkdir -p "$CONFIGS" "$DUMPS" "$READY"
 
-echo "==> building"
+echo "building"
 go build -o bin/node ./cmd/node
 
 for i in $(seq 1 "$NODES"); do
@@ -119,17 +119,17 @@ for i in $(seq 1 "$NODES"); do
 EOF
 done
 
-echo "==> starting ${NODES} nodes (base port ${BASE_PORT}, scheme ${SCHEME}, K=${K})"
+echo "starting ${NODES} nodes (base port ${BASE_PORT}, scheme ${SCHEME}, K=${K})"
 
 PIDS=()
 declare -A NODE_PIDS=()
 
 cleanup() {
   if [ "$HOLD" -eq 1 ]; then
-    echo "==> HOLD=1: leaving network running, pids: ${PIDS[*]:-}"
+    echo "HOLD=1: leaving network running, pids: ${PIDS[*]:-}"
     return
   fi
-  echo "==> stopping nodes"
+  echo "stopping nodes"
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
@@ -153,11 +153,11 @@ for i in $(seq 1 "$NODES"); do
   pid=$!
   PIDS+=("$pid")
   NODE_PIDS["node-${id}"]="$pid"
-  echo "  node-${id} pid=${pid} port=$((BASE_PORT + i - 1))"
+  echo "node-${id} pid=${pid} port=$((BASE_PORT + i - 1))"
   sleep 0.3
 done
 
-echo "==> waiting for readiness markers (timeout ${READY_TIMEOUT}s)"
+echo "waiting for readiness markers (timeout ${READY_TIMEOUT}s)"
 deadline=$(( $(date +%s) + READY_TIMEOUT ))
 while true; do
   ready_count=0
@@ -165,26 +165,26 @@ while true; do
     [ -f "$READY/node-$(printf '%02d' "$i")" ] && ready_count=$((ready_count + 1))
   done
   if [ "$ready_count" -eq "$NODES" ]; then
-    echo "  all ${NODES} nodes ready"
+    echo "all ${NODES} nodes ready"
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "  WARNING: timeout, ${ready_count}/${NODES} ready; continuing"
+    echo "WARNING: timeout, ${ready_count}/${NODES} ready; continuing"
     break
   fi
   sleep 0.2
 done
 
-echo "==> waiting for initial dumps"
+echo "waiting for initial dumps"
 dump_deadline=$(( $(date +%s) + DUMP_TIMEOUT ))
 while true; do
   count=$(ls -1 "$DUMPS"/routing-*-initial.json 2>/dev/null | wc -l)
   if [ "$count" -ge "$NODES" ]; then
-    echo "  got ${count} initial dumps"
+    echo "got ${count} initial dumps"
     break
   fi
   if [ "$(date +%s)" -ge "$dump_deadline" ]; then
-    echo "  WARNING: only ${count}/${NODES} initial dumps; continuing"
+    echo "WARNING: only ${count}/${NODES} initial dumps; continuing"
     break
   fi
   sleep 0.2
@@ -248,12 +248,12 @@ run_lookup() {
   rm -f "$trigger" "$done_path"
 
   echo -n "$tgt_id" > "$trigger"
-  echo "  trigger placed at $trigger"
+  echo "trigger placed at $trigger"
 
   local dl=$(( $(date +%s) + LOOKUP_TIMEOUT ))
   while [ ! -f "$done_path" ]; do
     if [ "$(date +%s)" -ge "$dl" ]; then
-      echo "  WARNING: lookup did not complete in time"
+      echo "WARNING: lookup did not complete in time"
       return 1
     fi
     sleep 0.2
@@ -261,58 +261,55 @@ run_lookup() {
   return 0
 }
 
-echo "==> selecting lookup pair"
+echo "selecting lookup pair"
 if select_pair ""; then
-  echo "  initiator=${INIT_NAME} (${INIT_ID:0:8}…)"
-  echo "  target   =${TGT_NAME} (${TGT_ID:0:8}…)"
-  echo "  target absent from initiator's INITIAL table — OK"
+  echo "initiator=${INIT_NAME} (${INIT_ID:0:8}…)"
+  echo "target   =${TGT_NAME} (${TGT_ID:0:8}…)"
+  echo "target absent from initiator's INITIAL table — OK"
 
   if run_lookup "$INIT_NAME" "$TGT_ID"; then
     idx=$(echo "$INIT_NAME" | sed 's/node-0*//')
     init_log="$STATE/node-$(printf '%02d' "$idx").log"
-    echo "==> lookup log ($init_log):"
+    echo "lookup log ($init_log):"
     grep -E "lookup target|closest:" "$init_log" || true
   fi
 else
-  echo "  no suitable pair found; skipping lookup"
+  echo "no suitable pair found; skipping lookup"
 fi
 
 if [ "$CHECK_NONDEGEN" -eq 1 ]; then
-  echo
-  echo "==> non-degeneracy check"
-  SCHEME="$SCHEME" NODES="$NODES" ./scripts/check_non_degenerate.sh || true
+  echo "non-degeneracy check"
+  SCHEME="$SCHEME" NODES="$NODES" RESULTS_DIR=results/2 ./scripts/check_non_degenerate.sh || true
 fi
 
 if [ "$SEED_FAILURE" -eq 1 ] && [ "$NODES" -gt 2 ]; then
-  echo
-  echo "==> seed failure test: killing node-01 (seed) and re-running lookup"
+  echo "seed failure test: killing node-01 (seed) and re-running lookup"
 
   SEED_PID="${NODE_PIDS[node-01]:-}"
   if [ -n "$SEED_PID" ]; then
     kill "$SEED_PID" 2>/dev/null || true
-    echo "  node-01 (pid=${SEED_PID}) killed"
+    echo "node-01 (pid=${SEED_PID}) killed"
   fi
 
   sleep 1
 
-  echo "==> selecting lookup pair after seed failure (node-01 excluded)"
+  echo "selecting lookup pair after seed failure (node-01 excluded)"
   if select_pair "node-01"; then
-    echo "  post-failure initiator=${INIT_NAME} (${INIT_ID:0:8}…)"
-    echo "  post-failure target   =${TGT_NAME} (${TGT_ID:0:8}…)"
+    echo "post-failure initiator=${INIT_NAME} (${INIT_ID:0:8}…)"
+    echo "post-failure target   =${TGT_NAME} (${TGT_ID:0:8}…)"
 
     if run_lookup "$INIT_NAME" "$TGT_ID"; then
       idx2=$(echo "$INIT_NAME" | sed 's/node-0*//')
       init_log2="$STATE/node-$(printf '%02d' "$idx2").log"
-      echo "==> post-failure lookup log ($init_log2):"
+      echo "post-failure lookup log ($init_log2):"
       grep -E "lookup target|closest:" "$init_log2" || true
     fi
   else
-    echo "  no suitable pair after seed failure; skipping"
+    echo "no suitable pair after seed failure; skipping"
   fi
 fi
 
-echo
-echo "==> routing table summary (initial snapshots, scheme=${SCHEME})"
+echo "routing table summary (initial snapshots, scheme=${SCHEME})"
 for f in "$DUMPS"/routing-*-initial.json; do
   [ -f "$f" ] || continue
   node=$(jq -r '.node_id[0:8]' "$f")
@@ -321,8 +318,7 @@ for f in "$DUMPS"/routing-*-initial.json; do
   printf "  %s…  contacts=%s  buckets=%s\n" "$node" "$total" "$buckets"
 done
 
-echo
-echo "==> artifacts (scheme=${SCHEME})"
+echo "artifacts (scheme=${SCHEME})"
 echo "  configs:  $CONFIGS"
 echo "  dumps:    $DUMPS"
 echo "  ready:    $READY"

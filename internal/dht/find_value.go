@@ -21,6 +21,7 @@ type FindValueResult struct {
 	RPCs       int               `json:"rpcs"`
 	Iterations int               `json:"iterations"`
 	Timeouts   int               `json:"timeouts"`
+	Responded  int               `json:"responded"`
 	DurationMs int64             `json:"duration_ms"`
 	Trace      []IterationTrace  `json:"trace"`
 
@@ -86,6 +87,9 @@ func (fv *FindValue) Run(ctx context.Context, key []byte) FindValueResult {
 				failed[keyOf(r.peer.NodeID)] = true
 				continue
 			}
+			all.markResponded(r.peer)
+			trace.Responded = append(trace.Responded, r.peer.NodeID)
+			res.Responded++
 			if r.rec != nil {
 				if err := r.rec.Verify(); err == nil {
 					if res.Record == nil || r.rec.SequenceNumber > res.Record.SequenceNumber {
@@ -106,14 +110,14 @@ func (fv *FindValue) Run(ctx context.Context, key []byte) FindValueResult {
 		}
 		res.Trace = append(res.Trace, trace)
 
-		kClosest := all.closest(key, fv.Cfg.KBucketSize)
-		if !all.hasUnqueriedCloserThan(key, queried, failed, kClosest) {
+		respondedClosest := all.respondedClosest(key, fv.Cfg.KBucketSize)
+		if !all.hasUnqueriedCloserThan(key, queried, failed, respondedClosest) {
 			break
 		}
 	}
 
 	res.Iterations = iteration
-	res.Closest = all.closest(key, fv.Cfg.KBucketSize)
+	res.Closest = all.respondedClosest(key, fv.Cfg.KBucketSize)
 	res.DurationMs = time.Since(start).Milliseconds()
 	return res
 }

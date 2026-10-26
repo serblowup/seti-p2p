@@ -30,26 +30,27 @@ func (rt *RoutingTable) bucketIndexLocked(nodeID []byte) int {
 	return idx
 }
 
-func (rt *RoutingTable) observeLocked(c Contact) (checkLRU bool, lru Contact, err error) {
+func (rt *RoutingTable) observeLocked(c Contact) (checkLRU bool, lru Contact, addressChanged bool, oldContact Contact, err error) {
 	if bytesEqual(rt.LocalID, c.NodeID) {
-		return false, Contact{}, errors.New("self contact")
+		return false, Contact{}, false, Contact{}, errors.New("self contact")
 	}
 	idx := rt.bucketIndexLocked(c.NodeID)
 	if idx < 0 {
-		return false, Contact{}, errors.New("invalid contact")
+		return false, Contact{}, false, Contact{}, errors.New("invalid contact")
 	}
 	b := rt.buckets[idx]
-	if b.Touch(c.NodeID) {
-		return false, Contact{}, nil
+	updated, old, found := b.TouchOrUpdate(c)
+	if found {
+		return false, Contact{}, updated, old, nil
 	}
 	if b.Len() < rt.KBucket {
-		return false, Contact{}, b.Add(c)
+		return false, Contact{}, false, Contact{}, b.Add(c)
 	}
 	lru, _ = b.LRU()
-	return true, lru, nil
+	return true, lru, false, Contact{}, nil
 }
 
-func (rt *RoutingTable) Observe(c Contact) (checkLRU bool, lru Contact, err error) {
+func (rt *RoutingTable) Observe(c Contact) (checkLRU bool, lru Contact, addressChanged bool, oldContact Contact, err error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	return rt.observeLocked(c)

@@ -15,14 +15,29 @@
 - TCP-сервер и клиент с собственным кадрированием;
 - строгая JSON-сериализация payload;
 - долговременная криптографическая идентичность на Ed25519;
+- сверка публичного ключа, выведенного из закрытого, с загруженным
+  `identity.pub`; при несовпадении узел не стартует;
 - ограниченная таблица маршрутизации Kademlia из 256 bucket;
 - операции `PING`, `FIND_NODE`, `STORE`, `FIND_VALUE`;
-- итеративный lookup с параллелизмом `ALPHA = 3`;
+- валидация `PONG` (`FromWire`, `NodeID` отвечающего, эхо
+  `PingTimestampMs`);
+- отклонение bad sender в `PING`/`FIND_NODE`/`STORE`/`FIND_VALUE`
+  с `ERROR` и закрытием соединения;
+- итеративный lookup с параллелизмом `ALPHA = 3`; раздельные
+  состояния `discovered` / `responded` / `failed`; `failed` не
+  опрашиваются повторно; условие остановки по `responded.closest(k)`;
 - bootstrap через seed-узел с последующим self-lookup;
 - четыре схемы начального подключения (`star`, `ring`, `tree`, `multi-seed`);
 - seed self-lookup для ускорения сходимости в `multi-seed`;
+- LRU-вытеснение контактов с `PING` перед заменой; фоновые
+  LRU-проверки с семафором `MaxBackgroundLRUChecks=4`;
+- обновление адреса контакта через `TouchOrUpdate` с подтверждением
+  по `PING` и откатом на старый адрес при неудаче;
 - сценарий отказа seed и серия контрольных lookup;
 - автоматическая проверка невырожденности DHT (`check_non_degenerate.sh`);
+- `bootstrap_schemes.sh` / `compare_bootstrap_schemes.sh` — четыре
+  схемы с сохранением конфигов, дампов, `buckets.csv`, `summary.json`
+  в `results/2/bootstrap-schemes/`;
 - воспроизводимая сравнительная оценка форматов сериализации;
 - подписанные `NodeRecord` с каноническим представлением;
 - локальное хранилище DHT;
@@ -56,9 +71,10 @@
    `256 × k_bucket_size` контактов и не более чем свои записи + записи,
    для которых он является хранителем.
 3. **Криптографически связанная идентичность.** `NodeID` детерминированно
-   вычисляется из долговременного публичного ключа.
+   вычисляется из долговременного публичного ключа; при загрузке
+   узел сверяет `priv.Public()` с загруженным `pub`.
 4. **Воспроизводимость.** Любой эксперимент запускается одной командой
-   и оставляет машиночитаемые артефакты.
+   и оставляет машиночитаемые артефакты в `results/<sprint>/`.
 5. **Расширяемость.** Добавление новых типов сообщений (TUNNEL_*,
    APP_*) не требует изменения формата кадра версии 1.
 
@@ -78,25 +94,30 @@ seti-p2p/
 ├── docs/
 │   ├── Architecture.md       # этот документ
 │   ├── Protocol.md           # спецификация протокола
-│   ├── Node record.md         # формат подписанной адресной записи
+│   ├── Node record.md        # формат подписанной адресной записи
 │   ├── Serialization comparison.md
 │   └── sprints/
 │       ├── 1.md
 │       ├── 2.md
 │       └── 3.md
 ├── internal/
-│   ├── config/               # парсинг конфигурации + env
-│   ├── identity/             # Ed25519, NodeID, загрузка/сохранение ключей
+│   ├── config/               # парсинг конфигурации + env + Validate
+│   ├── identity/             # Ed25519, NodeID, загрузка/сохранение ключей,
+│   │                         # сверка pub/priv при load
 │   ├── protocol/             # кадр, типы, JSON-кодеки, альтернативные кодеки
-│   ├── routing/              # Contact, XOR, k-bucket, RoutingTable (sync.Mutex)
-│   ├── transport/            # TCP-соединения, RPC-клиент
+│   ├── routing/              # Contact, XOR, k-bucket, RoutingTable
+│   │                         # (sync.Mutex, TouchOrUpdate, addressChanged)
+│   ├── transport/            # TCP-соединения, RPC-клиент,
+│   │                         # WriteFrameWithDeadline
 │   ├── dht/                  # итеративный FIND_NODE lookup (lookup.go)
 │   │                         # итеративный FIND_VALUE (find_value.go)
+│   │                         # responded vs discovered, failed
 │   ├── store/                # NodeRecord (record.go)
 │   │                         # локальное хранилище (store.go)
 │   ├── node/                 # узел: сервер, PING/FIND_NODE/STORE/FIND_VALUE,
-│   │                         # bootstrap, observe, Lookup,
-│   │                         # Put/Get/PutAlias/GetAlias, republish
+│   │                         # bootstrap, observeAsync/observeSync,
+│   │                         # maintainBucket + lruCheckSem,
+│   │                         # Lookup, Put/Get/PutAlias/GetAlias, republish
 │   ├── security/             # резерв под этап 4 (AKE, TLS)
 │   ├── tunnel/               # резерв под этап 5 (TUNNEL_*)
 │   ├── application/          # резерв под этап 5 (APP_*)
@@ -107,19 +128,28 @@ seti-p2p/
 │   ├── lookup.sh                  # серия контрольных lookup + CSV
 │   ├── bench.sh                   # сравнение форматов сериализации
 │   ├── check_non_degenerate.sh    # автоматическая проверка невырожденности DHT
+│   ├── bootstrap_schemes.sh       # 4 схемы: конфиги, дампы, buckets.csv, summary.json
+│   ├── compare_bootstrap_schemes.sh # сводка в bootstrap-comparison.txt
 │   └── store_experiment.sh        # эксперимент STORE / FIND_VALUE + отказ хранителя
+├── results/
+│   ├── 1/                   # serialization-sizes.txt, serialization-bench.txt
+│   ├── 2/                   # <scheme>-lookups.*, bootstrap-schemes/
+│   └── 3/                   # <scheme>-store.*
 └── tests/
-    ├── unit/                 # кадр, identity, bucket, payload,
-    │                         # negative, store, store_record
-    └── integration/          # bootstrap+lookup, STORE/FIND_VALUE,
-                              # dht_ops, alias, republish
+    ├── unit/                 # кадр, config, identity, bucket, payload,
+    │                         # negative, pong_validation, routing,
+    │                         # store, store_record
+    └── integration/          # e2e, negative_sender, lookup_stop,
+                              # observe, observe_async, address_update,
+                              # STORE/FIND_VALUE, dht_ops, alias, republish
 ```
 
 Каталоги `security/`, `tunnel/`, `application/`, `ui/`, `experiments/`
 на этапах 1–3 зарезервированы.
 
 Конфигурации для экспериментов генерируются скриптами `demo.sh`,
-`lookup.sh`, `store_experiment.sh` в `state-<scheme>/configs/`.
+`lookup.sh`, `bootstrap_schemes.sh`, `store_experiment.sh`
+в `state-<scheme>/configs/`.
 
 ### 2.2. Слои и ответственности
 
@@ -131,22 +161,28 @@ seti-p2p/
 ├─────────────────────────────────────────────┤
 │ internal/node                               │  жизненный цикл узла,
 │ server, ping/find_node/store/find_value     │  обработка RPC,
-│ handlers, bootstrap, observe, Lookup,       │  обновление таблицы,
+│ handlers, bootstrap, observeAsync/Sync,     │  обновление таблицы,
+│ maintainBucket, Lookup,                     │  фоновые LRU-проверки,
 │ Put/Get/PutAlias/GetAlias, republish        │  операции с записями
 ├─────────────────────────────────────────────┤
 │ internal/dht                                │  итеративный lookup
 │ (не имеет доступа к RoutingTable)           │  и итеративный FIND_VALUE
+│ responded / discovered / failed             │
 ├─────────────────────────────────────────────┤
 │ internal/store        internal/routing      │  NodeRecord, локальное
 │                                             │  хранилище; Contact, XOR,
-│                                             │  k-bucket, RoutingTable
+│                                             │  k-bucket, RoutingTable,
+│                                             │  TouchOrUpdate
 ├─────────────────────────────────────────────┤
 │ internal/identity      internal/protocol    │  Ed25519, NodeID,
+│                                             │  сверка pub/priv при load,
 │                                             │  кадр, JSON-кодеки
 ├─────────────────────────────────────────────┤
-│ internal/transport                          │  TCP, RPC-клиент
+│ internal/transport                          │  TCP, RPC-клиент,
+│                                             │  WriteFrameWithDeadline
 ├─────────────────────────────────────────────┤
-│ internal/config                             │  парсинг конфигурации
+│ internal/config                             │  парсинг конфигурации,
+│                                             │  Validate, applyEnv
 └─────────────────────────────────────────────┘
 ```
 
@@ -161,17 +197,21 @@ seti-p2p/
   `protocol`, цикла не возникает.
 - `routing` зависит от `protocol` (для `ContactWire`) и `identity`
   (для проверки `NodeID`). `RoutingTable` защищена `sync.Mutex`.
+  `TouchOrUpdate` возвращает старый контакт до перезаписи адреса.
 - `store` зависит от `identity` (для `ParsePublicKeyDER`,
   `VerifyNodeID`) и стандартной библиотеки. Не зависит от `protocol`,
-  `routing`, `dht`, `node`. Это позволяет использовать его в тестах
-  без поднятия узла.
+  `routing`, `dht`, `node`.
 - `dht` зависит от `routing`, `protocol`, `transport`, `config`,
   `store` (для `FindValueResult.Record`), но **не имеет доступа** к
   `RoutingTable`: работает с неизменяемым снимком `InitialCandidates`
-  и возвращает обнаруженные контакты в `Discovered`.
-- `node` собирает всё вместе: `node.observe` — единственная точка
-  обновления `RoutingTable`, `node.Lookup` обрабатывает `Discovered`,
-  `node.Put`/`Get`/`PutAlias`/`GetAlias` — операции с записями,
+  и возвращает обнаруженные контакты в `Discovered`. Внутри
+  `candidateSet` отдельно ведутся `byID` (discovered) и `responded`;
+  `failed` не опрашиваются повторно.
+- `node` собирает всё вместе: `observeAsync`/`observeSync` —
+  единственная точка обновления `RoutingTable`; `maintainBucket`
+  с семафором `lruCheckSem` ограничивает число фоновых LRU-проверок;
+  `node.Lookup` обрабатывает `Discovered` через `observeAsync`;
+  `node.Put`/`Get`/`PutAlias`/`GetAlias` — операции с записями;
   `node.republishOnce` — переопубликование.
 - `cmd/node` — единственный, кто зависит от `node`.
 
@@ -190,10 +230,9 @@ seti-p2p/
 и корреляцию запроса и ответа.
 
 **Сервер** при этом читает кадры в цикле и способен обработать
-несколько RPC в одном соединении (например, если клиент переиспользует
-соединение). Текущий `RPCClient` этим не пользуется, но такая
-возможность заложена в `handleConn` и пригодится на этапах 4–5, когда
-появится долгоживущий защищённый канал.
+несколько RPC в одном соединении. Текущий `RPCClient` этим не
+пользуется, но такая возможность заложена в `handleConn` и пригодится
+на этапах 4–5, когда появится долгоживущий защищённый канал.
 
 **Альтернативы:**
 
@@ -223,23 +262,34 @@ seti-p2p/
 
 - `connect_timeout_ms` — установление TCP;
 - `read_timeout_ms` — чтение кадра;
-- `ping_timeout_ms` — ожидание `PONG`.
+- `ping_timeout_ms` — ожидание `PONG`;
+- `write_timeout_ms` — запись кадра (`SetWriteDeadline`).
 
-Каждое чтение кадра вызывается через `SetReadDeadline`. Бесконечное
-ожидание запрещено на уровне архитектуры: если удалённый узел не
-отвечает, RPC завершается ошибкой и код возвращает управление.
+Каждое чтение кадра вызывается через `SetReadDeadline`, каждая запись
+через `SetWriteDeadline`. Бесконечное ожидание запрещено на уровне
+архитектуры: если удалённый узел не отвечает или перестал читать,
+RPC завершается ошибкой, и код возвращает управление.
 
 ### 3.3. Обработка ошибок
 
-Каждое входящее соединение обрабатывается в отдельной горутине.
-Ошибочный кадр от удалённого узла приводит к:
+Каждое входящее соединение обрабатывается в отдельной горутине и
+регистрируется в `Node.conns`. Ошибочный кадр от удалённого узла
+приводит к:
 
 1. Логированию причины.
-2. Отправке `ERROR` (если заголовок достоверно разобран).
+2. Отправке `ERROR` (если заголовок достоверно разобран) через
+   `WriteFrameWithDeadline`.
 3. Закрытию **соединения**, но не процесса.
 
 Это гарантирует, что один сбойный peer не уронит узел. Проверяется
 тестами `TestServerSurvives*` в `tests/unit/negative_test.go`.
+
+`Stop()` закрывает listener, вызывает `cancel()` на `baseCtx`
+(закрывает `watchCtx`, который закрывает listener и соединения),
+закрывает все активные соединения через `closeConns()` и ждёт
+`connWG`. Отмена контекста без `Stop()` также закрывает listener
+и соединения через `watchCtx`. Проверяется
+`TestStop*` и `TestStartCancel*`.
 
 ---
 
@@ -274,6 +324,10 @@ seti-p2p/
 
 **Альтернативные кодеки** (`internal/protocol/altcodecs.go`) сохранены
 для бенчмарка и будущего перехода при появлении больших записей.
+Бенчмарк меряет **реальный путь протокола**
+(`protocol.EncodePayload`, `protocol.DecodePing`,
+`protocol.DecodeFindNodeResponse`), а не прямой
+`json.Marshal`/`json.Unmarshal`.
 
 ### 4.3. Изоляция кодека
 
@@ -329,7 +383,7 @@ SubjectPublicKeyInfo** (результат `x509.MarshalPKIXPublicKey`).
 DER SPKI выбран как компромисс: он самодостаточен (алгоритм внутри),
 доступен в stdlib, стабилен между версиями Go.
 
-### 5.3. Хранение ключей
+### 5.3. Хранение ключей и сверка pub/priv
 
 Приватный ключ хранится в PEM-файле в `state_dir` узла. Каталог
 состояния индивидуален для каждого узла. Закрытый ключ никогда не
@@ -337,6 +391,24 @@ DER SPKI выбран как компромисс: он самодостаточ
 
 При повторном запуске из того же `state_dir` узел восстанавливает
 идентичность. Это гарантирует устойчивость `NodeID` между сессиями.
+
+**Сверка ключа при загрузке (E2-1).** `identity.load` после парсинга
+`identity.key` (PKCS#8) и `identity.pub` (SPKI) вычисляет
+`derived := priv.Public().(ed25519.PublicKey)` и сравнивает его с
+загруженным `pub` через `bytes.Equal`. При несовпадении —
+`identity: public key does not match private key`, `LoadOrCreate`
+возвращает ошибку, `node.New` падает, `main.go` завершается.
+
+`LoadOrCreate` также различает три случая: оба файла есть → `load`;
+только один есть → явная ошибка (`identity.key exists but identity.pub
+missing` / наоборот); оба отсутствуют → генерация новой пары.
+Раньше при наличии только `identity.pub` узел генерировал новую пару
+и затирал старый `identity.pub`; теперь это ошибка.
+
+Покрыто `TestIdentityLoadRejectsMismatchedKeys`,
+`TestIdentityLoadAcceptsMatchingKeys`, `TestIdentityLoadRejectsMissingPub`,
+`TestIdentityLoadRejectsMissingPriv`,
+`TestNodeNewFailsOnMismatchedIdentity`.
 
 ### 5.4. Подпись `NodeRecord`
 
@@ -385,27 +457,62 @@ DER SPKI выбран как компромисс: он самодостаточ
 Kademlia предписывает именно LRU-вытеснение с проверкой: живой
 контакт сохраняется, мёртвый вытесняется.
 
-### 6.3. `node.observe` как единая точка обновления
+**Ограничение фоновых проверок (E2-4).** `observeAsync` (вызывается из
+`handlePing`, `handleFindNode`, `handleStore`, `handleFindValue`)
+запускает `go maintainBucket(...)` только при `checkLRU=true` или
+`addressChanged=true`. `maintainBucket` захватывает слот в
+`lruCheckSem` (ёмкость `MaxBackgroundLRUChecks=4`); если семафор
+занят — возвращается без проверки, LRU сохраняется, новый контакт
+не добавляется. Это соответствует Kademlia: при переполненном bucket
+и занятых проверках новый контакт отбрасывается. Счётчик
+`lruChecksInFlight` (atomic) доступен через `LRUChecksInFlight()`
+для тестов.
 
-**Принято:** единственная точка входа для обновления таблицы —
-`node.observe`, которая вызывает `RoutingTable.Observe` и обрабатывает
-LRU-вытеснение через `PING`.
+`observeSync` (используется `ObserveContact` в тестах) вызывает
+`maintainBucketBlocking` без семафора, синхронно, чтобы тесты были
+детерминированы.
 
-Все вызывающие места — `handlePing`, `handleFindNode`, `handleStore`,
-`handleFindValue`, `bootstrapPing`, `node.Lookup`, `node.Get` — используют
-`node.observe`. Модули `dht.Lookup` и `dht.FindValue` **не имеют
-доступа** к `RoutingTable`: они работают с неизменяемым снимком
+### 6.3. Обновление адреса контакта (E2-7)
+
+`Bucket.TouchOrUpdate(c)` возвращает `(updated, oldSnapshot, found)`:
+- `oldSnapshot` — копия контакта **до** перезаписи `Host/Port`;
+- `updated = oldSnapshot.Host != c.Host || oldSnapshot.Port != c.Port`;
+- контакт перемещается в конец bucket (Touch).
+
+`RoutingTable.Observe` возвращает `(checkLRU, lru, addressChanged,
+oldContact, err)`. При `addressChanged=true` `node.observe`:
+- вызывает `pingContact(c)` для подтверждения нового адреса;
+- при `PONG` — `TouchVerified(c.NodeID, ...)`;
+- иначе — `ReplaceIfDead(c.NodeID, oldContact)` и лог
+  `observe: reverting address for <short> to <old>`.
+
+Это защищает от MITM-подмены адреса без подтверждения. Покрыто
+`TestObserveUpdatesContactAddress`,
+`TestObserveKeepsOldAddressIfNewUnreachable`,
+`TestNodeObserveUpdatesAddressAfterPing`,
+`TestNodeObserveKeepsOldAddressIfNewUnreachable`.
+
+### 6.4. `observeAsync` / `observeSync` как единая точка обновления
+
+**Принято:** все обработчики входящих RPC (`handlePing`,
+`handleFindNode`, `handleStore`, `handleFindValue`) и `bootstrapPing`
+вызывают `observeAsync(sender)`. `node.Lookup` и `node.Get`
+обрабатывают `Discovered` через `observeAsync`. `ObserveContact`
+(публичный, для тестов) вызывает `observeSync`.
+
+Модули `dht.Lookup` и `dht.FindValue` **не имеют доступа** к
+`RoutingTable`: они работают с неизменяемым снимком
 `InitialCandidates` и возвращают обнаруженные контакты в `Discovered`,
-а `node` обрабатывает их через `node.observe` после `wg.Wait()`.
+а `node` обрабатывает их через `observeAsync` после `wg.Wait()`.
 
 Это даёт:
 
+- обработчики входящих RPC не блокируются на LRU-проверке;
 - единое поведение для PING, FIND_NODE, STORE, FIND_VALUE и lookup;
-- единственное место для LRU-логики;
-- отсутствие гонок при параллельных запросах внутри lookup;
-- сохранение слоистости: `dht` не знает о `RoutingTable`.
+- единственное место для LRU-логики и обновления адреса;
+- отсутствие гонок при параллельных запросах внутри lookup.
 
-### 6.4. Потокобезопасность
+### 6.5. Потокобезопасность
 
 **Принято:** `RoutingTable` защищена `sync.Mutex`.
 
@@ -432,11 +539,33 @@ LRU-вытеснение через `PING`.
 
 Значение вынесено в конфигурацию и может быть изменено без правки кода.
 
-### 7.2. Условие остановки
+### 7.2. Состояния: discovered, responded, failed (E2-6)
 
-**Принято:** поиск продолжается, пока существует неопрошенный кандидат,
-который ближе текущего `k`-го ближайшего. Поиск останавливается, когда
-дальнейший опрос не может улучшить список ближайших `k` контактов.
+`candidateSet` ведёт два отображения:
+
+- `byID` — все **обнаруженные** контакты (из ответов);
+- `responded` — контакты, которые **ответили** на наш RPC.
+
+`failed` — отдельная map в `Run`; контакт, на который RPC завершился
+таймаутом или ошибкой, помечается `failed` и больше не опрашивается
+в этом lookup.
+
+**Различие принципиально:** контакт может быть `discovered` (пришёл в
+ответе), но не `responded` (мы его ещё не опрашивали или опрос
+завершился ошибкой). Условие остановки и итоговый `Closest` должны
+считаться по `responded`, а не по `discovered`.
+
+### 7.3. Условие остановки
+
+**Принято:** поиск продолжается, пока существует неопрошенный
+кандидат, который ближе текущего `k`-го **ответившего**. Поиск
+останавливается, когда дальнейший опрос не может улучшить список
+ближайших `k` **ответивших** контактов.
+
+`hasUnqueriedCloserThan(target, queried, failed, respondedClosest)`
+сравнивает неопрошенных кандидатов с `worst` из
+`respondedClosest(k)`. Если `responded` пуст — продолжает, пока есть
+неопрошенные (иначе поиск останавливался бы на первой итерации).
 
 **Альтернативы:**
 
@@ -444,43 +573,51 @@ LRU-вытеснение через `PING`.
 |---|---|---|
 | Остановка по «нашли цель» | Быстро для FIND_NODE | Не подходит для FIND_VALUE: нужно добирать до k ближайших |
 | Остановка по «нет новых кандидатов» | Тоже корректно | Может пропустить лучших кандидатов |
-| Остановка по k ближайшим (выбрано) | Совместимо с FIND_VALUE | Чуть больше RPC в редких случаях |
+| Остановка по k responded (выбрано) | Совместимо с FIND_VALUE; неопрошенные/failed не блокируют | Чуть больше RPC в редких случаях |
 
 Выбранное условие универсально: то же самое ядро lookup используется
 для `FIND_VALUE`.
 
-### 7.3. Трассировка и `Discovered`
+### 7.4. Трассировка и `Discovered`
 
 Каждый lookup возвращает `LookupResult` с полями `rpcs`, `iterations`,
-`timeouts`, `duration_ms`, `trace` и `Discovered`.
+`timeouts`, `responded`, `duration_ms`, `trace` и `Discovered`.
 
-`Discovered` — список всех валидных контактов, обнаруженных в ходе
-lookup. Поле не сериализуется в JSON (`json:"-"`) и используется
-вызывающей стороной (`node.Lookup`, `node.Get`) для обновления
-`RoutingTable`.
+`Discovered` — список **новых** контактов из ответов (тех, что
+впервые добавлены в `candidateSet`). Поле не сериализуется в JSON
+(`json:"-"`) и используется `node.Lookup`/`node.Get` для обновления
+`RoutingTable` через `observeAsync`.
 
-### 7.4. Итеративный `FIND_VALUE`
+`IterationTrace` содержит `Queried`, `Discovered`, `Responded` по
+итерациям.
+
+`LookupResult.Closest` — `respondedClosest(k)`, а не
+`all.closest(k)`. Это важно для `FIND_VALUE`: возвращаются ближайшие
+ответившие, а не формально близкие, но недоступные.
+
+### 7.5. Итеративный `FIND_VALUE`
 
 `internal/dht/find_value.go` реализует итеративный `FIND_VALUE` по
 той же структуре, что и `Lookup`:
 
 - `ALPHA` параллельных запросов на итерацию;
 - пул кандидатов (`candidateSet`);
-- условие остановки «нет неопрошенных ближе k-го ближайшего»;
+- `responded` / `failed` / `discovered`;
+- условие остановки «нет неопрошенных ближе k-го ответившего»;
 - трассировка по итерациям.
 
 Отличия:
 
 - отправляет `FIND_VALUE_REQUEST`, а не `FIND_NODE_REQUEST`;
 - при получении `Record` в ответе сохраняет его и **продолжает**
-  поиск до `k` ближайших, чтобы обнаружить более новую версию
+  поиск до `k` ответивших, чтобы обнаружить более новую версию
   у другого хранителя;
 - возвращает `FindValueResult` с полями `Key`, `Success`, `Record`,
-  `Closest`, `RPCs`, `Iterations`, `Timeouts`, `DurationMs`, `Trace`,
-  `Discovered`.
+  `Closest`, `RPCs`, `Iterations`, `Timeouts`, `Responded`,
+  `DurationMs`, `Trace`, `Discovered`.
 
 Как и `Lookup`, `FindValue` не имеет доступа к `RoutingTable`.
-`node.Get` обрабатывает `Discovered` через `node.observe`.
+`node.Get` обрабатывает `Discovered` через `observeAsync`.
 
 ---
 
@@ -597,6 +734,11 @@ lookup. Поле не сериализуется в JSON (`json:"-"`) и исп�
 локальный last-writer-wins, отсутствие глобальной согласованности,
 отсутствие защиты от захвата.
 
+Для теста `TestAliasLastWriterWins` добавлен
+`Node.BuildSelfRecordWithSeq(seq)`: строит запись через
+`BuildSelfRecord`, перезаписывает `SequenceNumber` и переподписывает.
+Это даёт детерминированный `SequenceNumber` без `time.Sleep`.
+
 ---
 
 ## 9. Bootstrap
@@ -617,7 +759,8 @@ lookup. Поле не сериализуется в JSON (`json:"-"`) и исп�
 ### 9.2. Схемы начального подключения
 
 Поддерживаются четыре схемы, задаваемые переменной `SCHEME` в
-`scripts/demo.sh`, `scripts/lookup.sh`, `scripts/store_experiment.sh`:
+`scripts/demo.sh`, `scripts/lookup.sh`, `scripts/bootstrap_schemes.sh`,
+`scripts/store_experiment.sh`:
 
 | Схема | Что знает узел `i` при старте |
 |---|---|
@@ -674,7 +817,7 @@ non-empty bucket.
 Оба lookup дают `success=true`. Это доказывает, что работа сети не
 зависит от доступности bootstrap-узла.
 
-### 9.6. Проверка невырожденности
+### 9.6. Проверка невырожденности и артефакты
 
 `scripts/check_non_degenerate.sh` автоматически проверяет три критерия:
 
@@ -683,12 +826,31 @@ non-empty bucket.
 3. Не менее 80% узлов имеют ≥2 непустых bucket.
 
 Критерии взяты из ТЗ, раздел 6. Результат сохраняется в
-`results/<scheme>-nondegeneracy.json`.
+`results/2/<scheme>-nondegeneracy.json` (при вызове из
+`bootstrap_schemes.sh` — в `results/2/bootstrap-schemes/<scheme>-nondegeneracy.json`).
 
 Скрипт завершается с `exit 2`, если число initial-дампов не совпадает
 с `NODES`: это исключает ложный PASS при неполном наборе данных.
 
-Все четыре схемы на `N=20, K=4` проходят проверку.
+**`scripts/bootstrap_schemes.sh` (E2-8).** Для каждой схемы:
+
+1. Поднимает сеть `N=20, K=4, ALPHA=3`.
+2. Ждёт готовности и initial-дампов.
+3. Вызывает `check_non_degenerate.sh` до `rm -rf "$state"`.
+4. Копирует `configs/` и `dumps/` в
+   `results/2/bootstrap-schemes/<scheme>/`.
+5. Строит `results/2/bootstrap-schemes/<scheme>/buckets.csv` с полями
+   `node_id,total_contacts,nonempty_buckets,bucket_index,contacts_in_bucket`.
+6. Пишет `results/2/bootstrap-schemes/<scheme>/summary.json` с полями
+   `scheme`, `N`, `K`, `alpha`, `avg_contacts`, `avg_nonempty_buckets`,
+   `nondegeneracy_pass`.
+
+`scripts/compare_bootstrap_schemes.sh` сводит четыре `summary.json` в
+`results/2/bootstrap-schemes/bootstrap-comparison.txt` (tab-separated,
+выровнено `column -t`).
+
+Результат на `N=20, K=4, ALPHA=3`: все 4 схемы `nondegeneracy_pass=true`,
+avg contacts 4.65–5.05, avg non-empty buckets 2.70–2.95.
 
 ### 9.7. Bootstrap в `store_experiment.sh`
 
@@ -727,22 +889,33 @@ reader'ов (`BASE_PORT`, `BASE_PORT+1`, `BASE_PORT+2`), а не один.
 развёртывания на этапах 5+ и для сценариев с ограниченной
 IP-достижимостью (несколько Docker-сетей, `nftables`).
 
-### 10.3. Конфигурация
+### 10.3. Конфигурация и валидация
 
 Все значимые параметры вынесены в JSON-конфиг и переменные окружения
 `SETI_*`. Изменение `N`, `k`, `ALPHA`, таймаутов, `ttl_seconds`
 не требует правки кода — только конфигурации.
 
+`config.Load` вызывает `applyEnv`, который возвращает ошибку при
+любом нераспарсенном `SETI_*` (`SETI_ALPHA=abc`,
+`SETI_LISTEN_PORT=70000`, `SETI_BOOTSTRAP_PEERS` без порта,
+`SETI_BOOTSTRAP_PEERS=127.0.0.1:abc`, `SETI_TTL_SECONDS=abc`,
+`SETI_K_BUCKET_SIZE=abc`, `SETI_WRITE_TIMEOUT_MS=abc`). Затем
+`Config.Validate()` проверяет диапазоны (`alpha >= 1`,
+`k_bucket_size >= 1`, `ttl_seconds >= 2`, `write_timeout_ms > 0`,
+`max_frame_payload ∈ (0, 65536]`, `node_id_bits == 256`,
+`protocol_version == 1`, непустые `bootstrap_peers[i].host` и
+ненулевые порты).
+
 Готовые конфигурации для экспериментов генерируются скриптами
-`demo.sh`, `lookup.sh`, `store_experiment.sh` в
-`state-<scheme>/configs/`.
+`demo.sh`, `lookup.sh`, `bootstrap_schemes.sh`,
+`store_experiment.sh` в `state-<scheme>/configs/`.
 
 ### 10.4. Сценарий `store_experiment.sh`
 
 Скрипт поднимает сеть `N = 20`, каждый узел публикует свою запись
 через `-publish-self`, скрипт собирает ключи из логов, убивает
 **именно хранителя** (по `stored_at`), поднимает reader-узлы с
-`-get-key` и собирает CSV.
+`-get-key` и собирает CSV в `results/3/<scheme>-store.csv`.
 
 ---
 
@@ -786,6 +959,14 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
   `Put` для ключа не набрал `acks >= 2`, `stored_at` содержит только
   владельца, и сценарий не находит второго хранителя для убийства.
   В этом случае скрипт печатает `WARNING: no replica found to kill`.
+- **`TestBackgroundLRUCheckLimited`** использует «немой» TCP-listener
+  и синтетический контакт (`NodeID` от `b`, порт от listener'а),
+  чтобы `pingContact` не завершался мгновенно. Это тестовая
+  конструкция для проверки семафора `MaxBackgroundLRUChecks`, а не
+  сценарий рабочей сети. Остальные тесты E2-4
+  (`TestPingDoesNotBlockOnLRUCheck`,
+  `TestObservePromotesAliveLRUAsync`,
+  `TestObserveReplacesDeadLRUAsync`) используют реальные узлы.
 
 ### 11.3. Митигации
 
@@ -793,9 +974,11 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
   таймаутах контролирует один фактор.
 - Серии на 30 наблюдений позволяют видеть распределение, а не
   отдельные наблюдения.
-- Сырые данные сохраняются в CSV для воспроизводимости.
+- Сырые данные сохраняются в `results/<sprint>/` для воспроизводимости.
 - Автоматическая проверка невырожденности (`check_non_degenerate.sh`)
   исключает субъективную оценку «достаточно ли заполнена таблица».
+- `bootstrap_schemes.sh` сохраняет конфиги, дампы, `buckets.csv`,
+  `summary.json` по каждой схеме — проверка воспроизводима.
 - `store_experiment.sh` использует три bootstrap-узла для reader'ов,
   чтобы отказ одного хранителя не блокировал bootstrap.
 - `stored_at` в логе `Put` позволяет убивать именно хранителя, а не
@@ -813,19 +996,30 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | Сервер допускает несколько RPC в соединении | Задел на этапы 4–5 |
 | Фиксированный 24-байтовый заголовок | Простой парсинг, расширяемость через `version`/`flags` |
 | JSON payload со строгим декодированием | Удобство отладки, отсутствие внешних зависимостей |
+| Бенчмарк меряет реальный путь протокола | Сравнение форматов соответствует рабочему коду |
 | Ed25519 долговременная идентичность | Стандарт, stdlib, короткие ключи |
 | `NodeID = SHA-256(DER SPKI)` | Самодостаточный canonical encoding |
+| Сверка `priv.Public()` с загруженным `pub` при `load` | Узел не может объявлять одну identity и подписывать другой |
 | 256 фиксированных bucket | Детерминированная структура, простой экспорт |
 | LRU с PING перед вытеснением | Соответствие спецификации Kademlia |
 | `sync.Mutex` в `RoutingTable` | Потокобезопасность при параллельных lookup |
 | `LastSeenMs` в `FromWire`, `LastVerifiedMs` в `observe` | Корректный LRU-порядок по времени |
+| `TouchOrUpdate` возвращает старый контакт до перезаписи адреса | Откат адреса при неудачном `PING` |
 | `ALPHA = 3` | Баланс сходимости и нагрузки, спецификация |
-| Условие остановки «нет лучших кандидатов» | Совместимо с `FIND_VALUE` |
-| Обновление таблицы в `node.Lookup` / `node.Get`, а не в `dht` | Слоистость, отсутствие гонок |
+| Разделение `discovered` / `responded` / `failed` | Условие остановки не блокируется недоступными кандидатами |
+| Условие остановки по `responded.closest(k)` | Совместимо с `FIND_VALUE` |
+| `failed` не опрашиваются повторно | Экономия RPC и таймаутов |
+| `observeAsync` + `maintainBucket` + семафор | Обработчики входящих RPC не блокируются на LRU-проверке |
+| `MaxBackgroundLRUChecks=4` | Ограничение фоновых проверок, Kademlia-совместимое отбрасывание |
+| Валидация `PONG` (`FromWire`, `NodeID`, эхо `PingTimestampMs`) | Защита от подмены отвечающего и повторного ответа |
+| `write_timeout_ms` + `WriteFrameWithDeadline` | Узел не зависает на клиенте, который перестал читать |
+| Учёт активных соединений (`Node.conns`, `connWG`) | `Stop()` закрывает соединения и ждёт обработчики |
+| `baseCtx`/`cancel` + `watchCtx` | Отмена контекста закрывает listener и соединения |
 | Seed как bootstrap, а не каталог | Децентрализация |
 | Схемы `star`/`ring`/`tree`/`multi-seed` — только начальное подключение | Разделение bootstrap-графа и underlay |
 | Seed self-lookup для `multi-seed` | Связность графа seed-узлов |
 | `check_non_degenerate.sh` с `exit 2` при неполном наборе дампов | Защита от ложного PASS |
+| `bootstrap_schemes.sh` + `compare_bootstrap_schemes.sh` | Артефакты по каждой схеме, сводная таблица в `results/2/` |
 | Кодек изолирован в `protocol` | Замена формата без переписывания |
 | Канонизация `NodeRecord` построчная | Детерминизм, читаемость, простота тестов |
 | Домен-разделитель `seti-p2p/record/v1` | Защита от переиспользования подписи |
@@ -833,7 +1027,8 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | `R = 3`, `StoreAckThreshold = 2` | Требование ТЗ, баланс между доступностью и стоимостью |
 | Владелец всегда кладёт запись локально | Источник для `republish`, устойчивость к отказу всех удалённых хранителей |
 | `republish` пересобирает запись | Продление TTL, иначе `ExpiresAt` не сдвигается |
-| `FIND_VALUE` добирает до `k` ближайших | Возможность найти более новую версию у другого хранителя |
+| `FIND_VALUE` добирает до `k` ответивших | Возможность найти более новую версию у другого хранителя |
+| `BuildSelfRecordWithSeq` для тестов | Детерминированный `SequenceNumber` без `time.Sleep` |
 | Локальный last-writer-wins по `sequence_number` | Без консенсуса — единственный практичный вариант |
 | Отсутствие глобальной согласованности | Осознанное ограничение модели (ТЗ §11.1) |
 
@@ -846,15 +1041,26 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | Логически разделённые подсистемы | §2 (дерево, слои) |
 | Транспорт TCP с кадрированием | §3, §4 |
 | Стратегия соединений (клиент — одно на RPC) | §3.1 |
+| Таймауты записи и чтения | §3.2 |
+| Учёт активных соединений, корректный `Stop()` | §3.3 |
 | Идентичность без случайной генерации `NodeID` | §5 |
+| Сверка `pub`/`priv` при `load` | §5.3 |
 | Kademlia-lite: XOR, k-bucket, LRU | §6 |
-| Потокобезопасность таблицы | §6.4 |
+| Потокобезопасность таблицы | §6.5 |
+| Обновление адреса контакта | §6.3 |
+| `observeAsync`/`observeSync` + семафор | §6.4, §6.2 |
 | Итеративный поиск с `ALPHA` | §7 |
+| Состояния `discovered`/`responded`/`failed` | §7.2 |
+| Условие остановки по `responded.closest(k)` | §7.3 |
+| Валидация `PONG` | §12, §13 (RPC) |
+| Отклонение bad sender | §12, §13 (RPC) |
 | Bootstrap без центрального каталога | §9 |
 | Четыре bootstrap-схемы (`star`, `ring`, `tree`, `multi-seed`) | §9.2 |
 | Seed self-lookup | §9.4 |
 | Автоматическая проверка невырожденности | §9.6 |
+| Артефакты bootstrap-схем | §9.6 |
 | Развёртывание и конфигурация без правки кода | §10 |
+| Валидация конфигурации и env | §10.3 |
 | `NodeRecord` с канонизацией и подписью | §8.1, `docs/NodeRecord.md` |
 | `STORE` / `FIND_VALUE` | §8.3, §8.4 |
 | Репликация `R = 3`, `acks >= 2` | §8.3 |

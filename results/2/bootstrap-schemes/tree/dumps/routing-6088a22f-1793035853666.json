@@ -1,0 +1,99 @@
+{
+  "node_id": "6088a22f10d255ffc87599678f3bca9fec13da927c1a2a6a95138830b54ccde0",
+  "k_bucket_size": 4,
+  "total_contacts": 8,
+  "buckets": [
+    {
+      "index": 0,
+      "contacts": [
+        {
+          "node_id": "fa4bb561ea8c61fe061c64e615afb9144e410b898a1a1c715e2faf1abc111ce7",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b657003210051a6429fc9fea96dc3b32b17b61cc1080f43f845a5ab66a901936268322dcc86",
+          "host": "127.0.0.1",
+          "port": 9109,
+          "last_seen_ms": 1793035851665,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "894aeca9a2312382b7ed63c6c1d0ea9b97efe9939845bc357efb6d20f85112a6",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100793e4d90b99dc5b24deb40c8ea888ccf3ba6d3992ced6136ee3e0bb00882bf35",
+          "host": "127.0.0.1",
+          "port": 9107,
+          "last_seen_ms": 1793035851664,
+          "last_verified_ms": 1793035851665
+        },
+        {
+          "node_id": "e0fd5922d88ea78f2aaee62510aa5fb42b1bd94f3dc331ded2cc55c90c0b3909",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b65700321006df216d9a6bdc0134ec44b1267d093ee62af7f69f45853be8d9b622d55205371",
+          "host": "127.0.0.1",
+          "port": 9108,
+          "last_seen_ms": 1793035851664,
+          "last_verified_ms": 1793035851665
+        },
+        {
+          "node_id": "f76f5333744d3036825d1d7e51f4ac8c48212610449c9a13a8baf41dea27de40",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100c0da0a652e7f2447b4fa5f60a354f2d55d81b67f62a88c59e5d5c495ba8cc7f6",
+          "host": "127.0.0.1",
+          "port": 9106,
+          "last_seen_ms": 1793035851665,
+          "last_verified_ms": 1793035851665
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "contacts": [
+        {
+          "node_id": "35685853282ded8afbf2599ae9f72823b71436f0a038f19b97908aa91dc92671",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100b14a758fd0ed1f3aca5e9dad8a6f24c5247911b01bed9629cc2b91d600b45436",
+          "host": "127.0.0.1",
+          "port": 9120,
+          "last_seen_ms": 1793035853482,
+          "last_verified_ms": 0
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "contacts": [
+        {
+          "node_id": "5f469142167ee4e091be431bbb9c2ebf25ee10c9555e08c8683e1190b3b82f86",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100202e11e39a78b6cde07d347959ca9f1464c05c6ab92b92fd94be91d4ddbccc2b",
+          "host": "127.0.0.1",
+          "port": 9105,
+          "last_seen_ms": 1793035851664,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "561c1e7436391bdaed376948a361d4b582e8151b33d983f6cb0c5bbc32d87a60",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b65700321007c8362866baa50a9f8d627170ca948cf9dc12afec3b45bea88831efadb084888",
+          "host": "127.0.0.1",
+          "port": 9116,
+          "last_seen_ms": 1793035852271,
+          "last_verified_ms": 0
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "contacts": [
+        {
+          "node_id": "76c5dead99db5531a1621ee3911b9e604b73c680b1a5cee3a0105fe347cf5ea3",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b65700321003a6f1f35976810c69c271985d0b78ebb3d466e5e53122422f872ade67fe7d69c",
+          "host": "127.0.0.1",
+          "port": 9103,
+          "last_seen_ms": 1793035851664,
+          "last_verified_ms": 0
+        }
+      ]
+    }
+  ]
+}

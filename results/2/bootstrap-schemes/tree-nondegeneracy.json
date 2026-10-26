@@ -1,0 +1,9 @@
+{
+  "scheme": "tree",
+  "total_nodes": 20,
+  "nodes_with_contacts_lt_n_minus_1": 20,
+  "threshold_80pct": 16,
+  "nodes_with_full_catalog": 0,
+  "nodes_with_structured_buckets": 16,
+  "pass": true
+}

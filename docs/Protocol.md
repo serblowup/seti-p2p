@@ -64,9 +64,12 @@ Kademlia, алгоритм итеративного поиска узлов и �
 | `connect_timeout_ms` | установление TCP-соединения | 3000 |
 | `read_timeout_ms` | ожидание кадра при RPC | 5000 |
 | `ping_timeout_ms` | ожидание `PONG` | 5000 |
+| `write_timeout_ms` | запись кадра | 5000 |
 
-Каждое чтение кадра выполняется с `SetReadDeadline`; бесконечное
-ожидание запрещено.
+Каждое чтение кадра выполняется с `SetReadDeadline`, каждая запись —
+с `SetWriteDeadline` (`WriteFrameWithDeadline`). Бесконечное ожидание
+запрещено: если удалённый узел не отвечает или перестал читать, RPC
+завершается ошибкой, и код возвращает управление.
 
 ### 3.3. Ограничения
 
@@ -74,6 +77,26 @@ Kademlia, алгоритм итеративного поиска узлов и �
 ровно один кадр, и **не предполагает**, что один `write()` соответствует
 одному чтению у получателя. Для чтения используется `io.ReadFull` до
 получения всего заголовка и всего payload.
+
+### 3.4. Учёт соединений и корректная остановка
+
+Каждое входящее соединение регистрируется в `Node.conns`
+(`map[net.Conn]struct{}`) и учитывается в `Node.connWG`
+(`sync.WaitGroup`). `Stop()`:
+
+1. вызывает `cancel()` на `baseCtx` (отмена контекста закрывает
+   listener и соединения через `watchCtx`);
+2. закрывает listener;
+3. вызывает `closeConns()` — закрывает все активные соединения;
+4. ждёт `connWG` — завершения всех `handleConn`.
+
+Отмена контекста без `Stop()` также закрывает listener и соединения
+через `watchCtx` (`<-ctx.Done()`, `ln.Close()`, `closeConns()`).
+Проверяется `TestStopClosesActiveConnections`,
+`TestStopWaitsForHandlers`, `TestStopClosesManyActiveConnections`,
+`TestStopDuringActiveHandler`, `TestStartCancelClosesListener`,
+`TestStartCancelClosesActiveConnections`, `TestStopCancelsContext`,
+`TestHandleConnClosesOnWriteError`.
 
 ---
 
@@ -127,8 +150,10 @@ Kademlia, алгоритм итеративного поиска узлов и �
 - запрос с типом, для которого нет обработчика.
 
 **При возможности** узел перед закрытием отправляет `ERROR` с тем же
-`request_id`. Отправка `ERROR` не производится, только если заголовок
-не может быть достоверно разобран или соединение уже разорвано.
+`request_id` через `WriteFrameWithDeadline` (ограничение времени записи,
+чтобы узел не завис на клиенте, переставшем читать). Отправка `ERROR`
+не производится, только если заголовок не может быть достоверно
+разобран или соединение уже разорвано.
 
 Код и сообщение ошибки не содержат стек вызовов, путей к файлам и
 закрытых ключей.
@@ -170,7 +195,8 @@ Payload сериализуется в **JSON** (RFC 8259) средствами �
 Обоснование выбора JSON приведено в `docs/Serialization comparison.md`:
 удобство отладки, строгая валидация через `DisallowUnknownFields` +
 `dec.More()`, отсутствие внешних зависимостей. Сравнение с
-MessagePack и CBOR выполнено в том же документе с числами.
+MessagePack и CBOR выполнено в том же документе с числами
+(`results/1/serialization-*.txt`).
 
 ### 6.2. Строгость декодирования
 
@@ -204,7 +230,8 @@ MessagePack и CBOR выполнено в том же документе с чи
 ```
 
 Поле `sender` — контакт отправителя; `timestamp_ms` — время отправки
-в миллисекундах Unix.
+в миллисекундах Unix. `timestamp_ms` эхом возвращается в `PONG`
+и проверяется инициатором.
 
 #### 6.3.2. `PONG`
 
@@ -367,7 +394,29 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 Реализация: `internal/identity/identity.go`, функции
 `CanonicalPublicKey`, `NodeIDFromPublicKey`, `VerifyNodeID`.
 
-### 7.3. Проверка контакта
+### 7.3. Сверка публичного ключа при загрузке
+
+При загрузке `identity.key` (PKCS#8) и `identity.pub` (SPKI)
+`identity.load` вычисляет `derived := priv.Public().(ed25519.PublicKey)`
+и сравнивает с загруженным `pub` через `bytes.Equal`. При несовпадении —
+ошибка `identity: public key does not match private key`; `LoadOrCreate`
+возвращает ошибку, `node.New` падает, `main.go` завершается.
+
+`LoadOrCreate` различает три случая:
+
+- оба файла есть — `load`;
+- только один есть — ошибка `identity.key exists but identity.pub missing`
+  или наоборот (раньше при наличии только `identity.pub` узел
+  генерировал новую пару и затирал старый `identity.pub`);
+- оба отсутствуют — генерация новой пары.
+
+Покрыто `TestIdentityLoadRejectsMismatchedKeys`,
+`TestIdentityLoadAcceptsMatchingKeys`,
+`TestIdentityLoadRejectsMissingPub`,
+`TestIdentityLoadRejectsMissingPriv`,
+`TestNodeNewFailsOnMismatchedIdentity`.
+
+### 7.4. Проверка контакта
 
 Полученный по сети контакт считается структурно допустимым только при
 выполнении всех условий:
@@ -383,8 +432,11 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 первого успешного `PONG`.
 
 Реализация: `internal/routing/contact.go`, функция `FromWire`.
+Покрыто 9 `TestFromWire*` (accept valid, bad DER, NodeID mismatch,
+mismatched key+NodeID, short/long NodeID, bad algorithm, empty host,
+zero port).
 
-### 7.4. Ограничения модели идентичности
+### 7.5. Ограничения модели идентичности
 
 Криптографическая **аутентификация удалённой стороны на уровне
 канала не выполняется**. Публичный ключ передаётся в составе
@@ -393,7 +445,7 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 собственный AKE) — предмет этапа 4. Это ограничение явно
 фиксируется в отчёте.
 
-### 7.5. Подпись `NodeRecord`
+### 7.6. Подпись `NodeRecord`
 
 `NodeRecord` подписывается тем же долговременным Ed25519-ключом,
 что и `NodeID`. Это гарантирует, что запись с данным `NodeID` может
@@ -440,8 +492,9 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 | `last_verified_ms` | uint64 | Локальное время последнего успешного `PONG` от контакта |
 
 `LastSeenMs` устанавливается в `FromWire` в момент приёма контакта.
-`LastVerifiedMs` обновляется в `node.observe` после успешного `PONG`
-через `Contact.MarkVerified()` и `RoutingTable.TouchVerified`.
+`LastVerifiedMs` обновляется в `node.observeAsync`/`observeSync` после
+успешного `PONG` через `Contact.MarkVerified()` и
+`RoutingTable.TouchVerified`.
 
 Узел **никогда** не доверяет значениям `last_seen_ms` из сети.
 
@@ -451,7 +504,7 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 - Контакт с тем же `NodeID`, но иным `identity_public_key`, отклоняется
   как нарушение идентичности.
 - Контакт с тем же `NodeID` и иным `host:port` обновляется только после
-  успешной проверки доступности.
+  успешной проверки доступности (см. §10.4).
 
 ---
 
@@ -515,36 +568,103 @@ bucket** по индексу старшего установленного би�
 Внутренняя реализация `observeLocked` используется внутри уже
 захваченного мьютекса, чтобы избежать двойного захвата.
 
-Это позволяет вызывать `Observe` из `node.observe` параллельно из
-`handlePing`, `handleFindNode`, `handleStore`, `handleFindValue` и
-`node.Lookup` / `node.Get` без гонок.
+Это позволяет вызывать `Observe` из `node.observeAsync`/`observeSync`
+параллельно из `handlePing`, `handleFindNode`, `handleStore`,
+`handleFindValue` и `node.Lookup` / `node.Get` без гонок.
 
-### 10.4. Операция `Observe`
+### 10.4. Операция `Observe` и `TouchOrUpdate`
 
 При получении корректного кадра от удалённого узла либо корректного
-`PONG` вызывается `node.observe`, которая вызывает `RoutingTable.Observe`:
+`PONG` вызывается `node.observeAsync(sender)` (из обработчиков входящих
+RPC) либо `node.observeSync(sender)` (из `ObserveContact` в тестах).
+Оба вызывают `RoutingTable.Observe(c)`.
 
-1. Контакт проверяется по правилам §7.3.
-2. Если контакт уже есть в bucket, он перемещается в конец (**Touch**).
-3. Если контакта нет и bucket не заполнен — контакт добавляется в конец.
-4. Если контакт отсутствует и bucket заполнен, `Observe` возвращает
-   `checkLRU = true` и LRU-контакт. **Вызывающий код** (`node.observe`)
-   обязан выполнить `PING` LRU-контакта:
-   - при успешном `PONG` — `Promote(LRU)`, новый контакт не добавляется;
-   - при тайм-ауте — `ReplaceIfDead(LRU, c)`, LRU-контакт вытесняется.
+`RoutingTable.Observe` возвращает `(checkLRU, lru, addressChanged,
+oldContact, err)`. Внутри используется `Bucket.TouchOrUpdate(c)`:
 
-`node.observe` — **единственная точка** обновления таблицы. Модули
-`dht.Lookup` и `dht.FindValue` не имеют доступа к `RoutingTable`.
+1. Если `NodeID` уже есть в bucket:
+   - `oldSnapshot` = копия контакта до перезаписи `Host/Port`;
+   - `updated = oldSnapshot.Host != c.Host || oldSnapshot.Port != c.Port`;
+   - если `updated`, `Host/Port` в bucket заменяются на новые;
+   - контакт перемещается в конец (Touch);
+   - возвращается `(updated, oldSnapshot, found=true)`.
+2. Если `NodeID` нет и bucket не заполнен — контакт добавляется в конец,
+   `checkLRU=false`.
+3. Если `NodeID` нет и bucket заполнен — возвращается
+   `checkLRU=true`, `lru` (первый контакт bucket).
 
-Реализация: `internal/routing/table.go`, `internal/node/node.go`
-(функция `observe`).
+**Обработка `checkLRU` и `addressChanged`:**
 
-### 10.5. Правила, которые запрещены
+- `observeAsync` при `checkLRU=true` или `addressChanged=true` запускает
+  `go maintainBucket(...)` (см. §10.5).
+- `observeSync` при тех же условиях вызывает `maintainBucketBlocking(...)`
+  синхронно (для детерминизма тестов).
+
+`maintainBucket` / `maintainBucketBlocking` вызывают `doMaintain`:
+
+- при `addressChanged=true` → `pingContact(c)`:
+  - при `PONG` — `TouchVerified(c.NodeID, ...)`, новый адрес
+    остаётся;
+  - иначе — `ReplaceIfDead(c.NodeID, oldContact)`, адрес
+    откатывается, лог `observe: reverting address for <short> to <host:port>`;
+- при `checkLRU=true` → `pingContact(lru)`:
+  - при `PONG` — `Promote(lru.NodeID)`, новый контакт `c` не
+    добавляется;
+  - иначе — `ReplaceIfDead(lru.NodeID, c)`.
+
+**`node.observeAsync` / `observeSync` — единственная точка** обновления
+таблицы. Модули `dht.Lookup` и `dht.FindValue` не имеют доступа к
+`RoutingTable`.
+
+Реализация: `internal/routing/table.go`, `internal/routing/bucket.go`,
+`internal/node/node.go` (`observeAsync`, `observeSync`,
+`maintainBucket`, `maintainBucketBlocking`, `doMaintain`).
+
+Покрыто `TestObserveUpdatesContactAddress`,
+`TestObserveKeepsOldAddressIfNewUnreachable`,
+`TestNodeObserveUpdatesAddressAfterPing`,
+`TestNodeObserveKeepsOldAddressIfNewUnreachable`,
+`TestObservePromotesAliveLRU`, `TestObserveReplacesDeadLRU`,
+`TestObserveTouchDoesNotPing`,
+`TestObserveAddToNonFullBucketDoesNotPing`.
+
+### 10.5. Ограничение фоновых LRU-проверок
+
+`observeAsync` (вызывается из `handlePing`, `handleFindNode`,
+`handleStore`, `handleFindValue`, `bootstrapPing`, `node.Lookup`,
+`node.Get`) запускает `go maintainBucket(...)` только при
+`checkLRU=true` или `addressChanged=true`.
+
+`maintainBucket` захватывает слот в `lruCheckSem` (буферизованный
+канал ёмкости `MaxBackgroundLRUChecks=4`):
+
+- если слот свободен — захватывает, увеличивает `lruChecksInFlight`
+  (atomic), вызывает `doMaintain`, отпускает слот, уменьшает счётчик;
+- если семафор занят — возвращается без проверки: LRU сохраняется,
+  новый контакт `c` не добавляется, `addressChanged` не применяется.
+
+Это соответствует Kademlia: при переполненном bucket и занятых
+проверках новый контакт отбрасывается. Счётчик `lruChecksInFlight`
+доступен через `Node.LRUChecksInFlight()` для тестов.
+
+Покрыто `TestPingDoesNotBlockOnLRUCheck` (PING < 100 мс при мёртвом LRU),
+`TestBackgroundLRUCheckLimited` (`maxInFlight ≤ 4`),
+`TestObservePromotesAliveLRUAsync`, `TestObserveReplacesDeadLRUAsync`.
+
+**Оговорка:** `TestBackgroundLRUCheckLimited` использует «немой»
+TCP-listener и синтетический контакт (`NodeID` от `b`, порт от
+listener'а), чтобы `pingContact` не завершался мгновенно. Это
+тестовая конструкция для проверки семафора, а не сценарий рабочей
+сети. Остальные тесты E2-4 используют реальные узлы.
+
+### 10.6. Правила, которые запрещены
 
 - Вытеснение живого контакта без проверки только потому, что новый
   контакт имеет меньшее расстояние до локального узла.
 - Добавление в таблицу двух контактов с одним и тем же `NodeID`.
 - Добавление в таблицу контакта с локальным `NodeID`.
+- Обновление `Host/Port` контакта без подтверждения по `PING`
+  (E2-7: при неудачном `pingContact` адрес откатывается на старый).
 
 ---
 
@@ -565,17 +685,41 @@ bucket** по индексу старшего установленного би�
 | `connect_timeout_ms` | int | `3000` | Таймаут установления TCP |
 | `read_timeout_ms` | int | `5000` | Таймаут чтения кадра |
 | `ping_timeout_ms` | int | `5000` | Таймаут `PONG` |
+| `write_timeout_ms` | int | `5000` | Таймаут записи кадра |
 | `max_frame_payload` | int | `65536` | Максимальный размер payload |
 | `protocol_version` | uint8 | `1` | Версия протокола |
 | `log_level` | string | `"INFO"` | Уровень журналирования |
 | `ttl_seconds` | int | `180` | TTL записи DHT; переопубликование раз в `TTL/2` |
 
-Параметры `k_bucket_size`, `alpha`, `ttl_seconds` могут быть
-переопределены переменными окружения `SETI_K_BUCKET_SIZE`,
-`SETI_ALPHA`, `SETI_TTL_SECONDS` без правки JSON-конфигурации.
+**Валидация.** `config.Load` вызывает `applyEnv`, который возвращает
+ошибку при любом нераспарсенном `SETI_*`:
+
+- `SETI_ALPHA=abc`, `SETI_K_BUCKET_SIZE=abc`, `SETI_TTL_SECONDS=abc`,
+  `SETI_WRITE_TIMEOUT_MS=abc`;
+- `SETI_LISTEN_PORT=x` или `SETI_LISTEN_PORT=70000` (вне `0..65535`);
+- `SETI_BOOTSTRAP_PEERS` без порта (`127.0.0.1`) или с битым портом
+  (`127.0.0.1:abc`).
+
+Затем `Config.Validate()` проверяет:
+
+- `node_id_bits == 256`;
+- `k_bucket_size >= 1`;
+- `alpha >= 1`;
+- `connect_timeout_ms > 0`, `read_timeout_ms > 0`,
+  `ping_timeout_ms > 0`, `write_timeout_ms > 0`;
+- `max_frame_payload ∈ (0, 65536]`;
+- `protocol_version == 1`;
+- `ttl_seconds >= 2`;
+- `bootstrap_peers[i].host` не пуст, `port != 0`.
+
+Параметры `k_bucket_size`, `alpha`, `ttl_seconds`, `write_timeout_ms`
+могут быть переопределены переменными окружения
+`SETI_K_BUCKET_SIZE`, `SETI_ALPHA`, `SETI_TTL_SECONDS`,
+`SETI_WRITE_TIMEOUT_MS` без правки JSON-конфигурации.
 
 Готовые конфигурации для экспериментов генерируются скриптами
-`scripts/demo.sh`, `scripts/lookup.sh`, `scripts/store_experiment.sh`
+`scripts/demo.sh`, `scripts/lookup.sh`,
+`scripts/bootstrap_schemes.sh`, `scripts/store_experiment.sh`
 в каталоге `state-<scheme>/configs/`.
 
 Реализация: `internal/config/config.go`.
@@ -589,10 +733,15 @@ bucket** по индексу старшего установленного би�
 Получив `PING`, узел обязан:
 
 1. Декодировать payload строго (§6.2).
-2. Проверить структуру контакта отправителя (§7.3).
+2. Проверить структуру контакта отправителя (§7.4).
 3. Обработать контакт отправителя в таблице маршрутизации через
-   `node.observe` (§10.4).
+   `observeAsync` (§10.4).
 4. Сформировать `PONG` с тем же `request_id` и тем же `ping_timestamp_ms`.
+
+Если контакт отправителя структурно некорректен (`FromWire` вернул
+ошибку), узел возвращает `ERROR` и закрывает соединение (§4.4).
+Покрыто `TestPingRejectsBadSenderContact`,
+`TestPingRejectsBadSenderAndClosesConn`.
 
 ### 12.2. Обработка ответа
 
@@ -600,16 +749,24 @@ bucket** по индексу старшего установленного би�
 
 - `request_id` совпадает с ожидающим;
 - ответ получен до `ping_timeout_ms`;
-- контакт ответчика структурно корректен;
-- если запрос адресован конкретному контакту — `node_id` ответчика
-  совпадает с ожидаемым.
+- `DecodePong` не вернул ошибку (включая пустой payload);
+- `routing.FromWire(p.Responder)` вернул валидный контакт
+  (отклоняет `ContactWire{}`, пустой `Host`, `Port=0`, bad DER);
+- если запрос адресован конкретному контакту — `responder.NodeID`
+  совпадает с ожидаемым `c.NodeID`;
+- `p.PingTimestampMs == pingTS` (эхо таймстампа запроса).
 
 После успешного `PONG` контакт ответчика обновляется в таблице
 маршрутизации, а `LastVerifiedMs` устанавливается в текущее время
 через `RoutingTable.TouchVerified`.
 
+Покрыто `TestPingContactAcceptsValidPong`,
+`TestPingContactRejectsEmptyPongPayload`,
+`TestPingRejectsMismatchedResponder`,
+`TestPingContactRejectsZeroResponder`.
+
 Реализация: `internal/node/node.go`, функции `handlePing`,
-`pingContact`, `Ping`.
+`pingContact`, `Ping`, `bootstrapPing`.
 
 ---
 
@@ -621,9 +778,9 @@ bucket** по индексу старшего установленного би�
 
 1. Декодировать payload строго.
 2. Проверить длину `target_node_id` (ровно 32 байта).
-3. Проверить структуру контакта отправителя.
+3. Проверить структуру контакта отправителя через `routing.FromWire`.
 4. Обработать контакт отправителя в таблице маршрутизации через
-   `node.observe`.
+   `observeAsync`.
 5. Найти до `k_bucket_size` известных контактов, ближайших к
    `target_node_id` по XOR-метрике.
 6. Исключить из ответа контакт отправителя и локальный контакт.
@@ -634,6 +791,9 @@ bucket** по индексу старшего установленного би�
 Ответ может быть пустым, если у узла нет подходящих контактов.
 Отправка искусственно сгенерированных контактов, контактов из
 центрального реестра или полного списка всех узлов запрещена.
+
+Если контакт отправителя структурно некорректен — `ERROR` и закрытие
+соединения. Покрыто `TestFindNodeRejectsBadSenderContact`.
 
 Реализация: `internal/node/node.go`, функция `handleFindNode`.
 
@@ -663,43 +823,68 @@ lookup_node(target_node_id) -> LookupResult
 | Поле | Тип | Смысл |
 |---|---|---|
 | `target` | `[]byte` | Целевой `NodeID` |
-| `success` | bool | `true`, если целевой `NodeID` найден |
-| `closest` | `[]Contact` | До `k_bucket_size` ближайших контактов |
+| `success` | bool | `true`, если целевой `NodeID` найден среди `responded.closest(k)` |
+| `closest` | `[]Contact` | До `k_bucket_size` ближайших **ответивших** контактов (`respondedClosest(k)`) |
 | `rpcs` | int | Число отправленных RPC |
 | `iterations` | int | Число итераций |
 | `timeouts` | int | Число таймаутов |
+| `responded` | int | Число контактов, ответивших на RPC |
 | `duration_ms` | int64 | Длительность в миллисекундах |
-| `trace` | `[]IterationTrace` | Трассировка по итерациям |
-| `discovered` | `[]Contact` | Валидные контакты, обнаруженные в ходе lookup. Не сериализуется в JSON (`json:"-"`). Используется `node.Lookup` для обновления `RoutingTable` через `node.observe`. |
+| `trace` | `[]IterationTrace` | Трассировка по итерациям (`Queried`, `Discovered`, `Responded`) |
+| `discovered` | `[]Contact` | **Новые** контакты из ответов (впервые добавленные в `candidateSet`). Не сериализуется в JSON (`json:"-"`). Используется `node.Lookup` для обновления `RoutingTable` через `observeAsync`. |
 
-`IterationTrace` содержит номер итерации, список опрошенных и список
-обнаруженных контактов.
+`IterationTrace` содержит номер итерации, список опрошенных,
+обнаруженных и ответивших контактов.
 
 ### 14.2. Алгоритм
 
 Параллелизм `ALPHA` (`alpha` в конфигурации) определяет число
 одновременных запросов на итерацию. По умолчанию `ALPHA = 3`.
 
+`candidateSet` ведёт два отображения:
+
+- `byID` — все **обнаруженные** контакты (из ответов);
+- `responded` — контакты, которые **ответили** на наш RPC.
+
+`failed` — отдельная map в `Run`: контакт, на который RPC завершился
+таймаутом или ошибкой, помечается `failed` и больше не опрашивается
+в этом lookup.
+
 1. Из таблицы маршрутизации выбираются до `k_bucket_size` ближайших
    к цели контактов — начальный набор кандидатов (`InitialCandidates`).
 2. Кандидаты сортируются по возрастанию XOR-расстояния до цели.
-3. На каждой итерации выбираются до `ALPHA` ещё неопрошенных кандидатов,
-   ближайших к цели.
+3. На каждой итерации выбираются до `ALPHA` ещё неопрошенных и
+   не-`failed` кандидатов, ближайших к цели.
 4. Выбранным кандидатам параллельно отправляются `FIND_NODE_REQUEST`.
-5. Корректные ответы объединяются с текущим набором кандидатов;
-   дубликаты удаляются по `NodeID`.
-6. Контакты, завершившиеся тайм-аутом или ошибкой, фиксируются как
-   `failed` и не опрашиваются повторно в этом lookup.
+5. При успешном ответе `peer` помечается `responded`; контакты из
+   ответа добавляются в `byID` (дубликаты по `NodeID` отбрасываются).
+6. При ошибке `peer` помечается `failed`.
 7. Поиск продолжается, пока существует хотя бы один неопрошенный
-   кандидат, который ближе текущего `k`-го ближайшего.
-8. Поиск завершается, когда дальнейший опрос не может улучшить список
-   ближайших `k` контактов, либо когда пул неопрошенных кандидатов
-   исчерпан.
+   и не-`failed` кандидат, который ближе текущего `k`-го
+   **ответившего** (`respondedClosest(k)`). Если `responded` пуст —
+   продолжается, пока есть неопрошенные.
+8. Поиск завершается, когда дальнейший опрос не может улучшить
+   список ближайших `k` ответивших, либо когда пул неопрошенных
+   кандидатов исчерпан.
 
 Условие остановки (§14.2, п. 7) **не зависит** от того, найдена ли цель
 в одном из ответов. Это принципиально для `FIND_VALUE`: поиск
-добирает до `k` ближайших хранителей, даже если значение уже
+добирает до `k` ответивших хранителей, даже если значение уже
 получено от одного из них.
+
+**Почему `responded`, а не `discovered`.** Контакт может быть
+`discovered` (пришёл в ответе), но не `responded` (мы его ещё не
+опрашивали или опрос завершился ошибкой). Если считать `kClosest`
+по `discovered`, неопрошенный «формально близкий» недоступный
+контакт займёт слот, и поиск остановится, не опросив его.
+Поэтому `hasUnqueriedCloserThan` сравнивает неопрошенных с
+`worst` из `respondedClosest(k)`, а итоговый `res.Closest` —
+`respondedClosest(k)`.
+
+Покрыто `TestLookupDistinguishesDiscoveredAndResponded`,
+`TestLookupDoesNotQueryFailed`,
+`TestLookupStopsOnRespondedKClosest`,
+`TestLookupSuccessWithDeadIntermediate`.
 
 ### 14.3. Отсутствие доступа к `RoutingTable`
 
@@ -707,7 +892,7 @@ lookup_node(target_node_id) -> LookupResult
 неизменяемым снимком `InitialCandidates`, взятым из таблицы до начала
 lookup. Все обнаруженные контакты возвращаются в
 `LookupResult.Discovered`, а вызывающая сторона (`node.Lookup`)
-обрабатывает их через `node.observe` после `wg.Wait()`.
+обрабатывает их через `observeAsync` после `wg.Wait()`.
 
 Это устраняет гонки при параллельных запросах внутри lookup и
 сохраняет слоистость: `dht` не знает о `RoutingTable`.
@@ -723,7 +908,8 @@ lookup target=<hex> success=<bool> rpcs=<N> iters=<N> timeouts=<N> duration=<N>m
 ```
 
 Формат строки фиксирован. По нему работает парсер в `scripts/lookup.sh`,
-который собирает CSV-серию экспериментов.
+который собирает CSV-серию экспериментов в
+`results/2/<scheme>-lookups.csv`.
 
 Реализация: `internal/dht/lookup.go`, `internal/node/lookup.go`,
 `cmd/node/main.go`.
@@ -742,21 +928,25 @@ Seed-узел запускается с пустым `bootstrap_peers`. Это *
 
 Новый узел с непустым `bootstrap_peers` обязан выполнить:
 
-1. Загрузку или создание identity-ключа и вычисление `NodeID`.
+1. Загрузку или создание identity-ключа и вычисление `NodeID`
+   (с проверкой `pub`/`priv` при загрузке, §7.3).
 2. Установление TCP-соединения с хотя бы одним bootstrap-контактом.
 3. `PING` bootstrap-узлу.
-4. Добавление подтверждённого bootstrap-контакта в таблицу маршрутизации
-   через `node.observe`.
-5. Итеративный `FIND_NODE` для **собственного** `NodeID` (self-lookup).
-6. Сохранение итогового состояния таблицы и журнала bootstrap-процесса.
+4. Проверку `PONG` (валидация `PONG`, §12.2: `FromWire`,
+   `NodeID` не совпадает с self, эхо `PingTimestampMs`).
+5. Добавление подтверждённого bootstrap-контакта в таблицу
+   маршрутизации через `observeAsync`.
+6. Итеративный `FIND_NODE` для **собственного** `NodeID` (self-lookup).
+7. Сохранение итогового состояния таблицы и журнала bootstrap-процесса.
 
-После шага 5 bootstrap-узел **не требуется** для дальнейших lookup:
+После шага 6 bootstrap-узел **не требуется** для дальнейших lookup:
 таблица заполнена и поиск идёт по ней.
 
 ### 15.3. Схемы начального подключения
 
 Поддерживаются четыре схемы, задаваемые переменной `SCHEME` в
-`scripts/demo.sh`, `scripts/lookup.sh`, `scripts/store_experiment.sh`:
+`scripts/demo.sh`, `scripts/lookup.sh`,
+`scripts/bootstrap_schemes.sh`, `scripts/store_experiment.sh`:
 
 | Схема | Что знает узел `i` при старте |
 |---|---|
@@ -806,7 +996,7 @@ non-empty bucket.
 seed-узел убивается, и повторный lookup выполняется между двумя
 другими узлами.
 
-### 15.7. Проверка невырожденности
+### 15.7. Проверка невырожденности и артефакты
 
 `scripts/check_non_degenerate.sh` проверяет три критерия:
 
@@ -814,10 +1004,30 @@ seed-узел убивается, и повторный lookup выполняе�
 2. Ни у одного узла нет полного каталога (`contacts >= N-1`).
 3. Не менее 80% узлов имеют ≥2 непустых bucket.
 
-Результат сохраняется в `results/<scheme>-nondegeneracy.json`.
+Результат сохраняется в `results/2/<scheme>-nondegeneracy.json`.
 
 Скрипт завершается с `exit 2`, если число initial-дампов не совпадает
 с `NODES`: это исключает ложный PASS при неполном наборе данных.
+
+**`scripts/bootstrap_schemes.sh` (E2-8).** Для каждой из четырёх схем:
+
+1. Поднимает сеть `N=20, K=4, ALPHA=3`.
+2. Ждёт готовности и initial-дампов.
+3. Вызывает `check_non_degenerate.sh` до `rm -rf "$state"`
+   (результат — `results/2/bootstrap-schemes/<scheme>-nondegeneracy.json`).
+4. Копирует `configs/` и `dumps/` в
+   `results/2/bootstrap-schemes/<scheme>/`.
+5. Строит `results/2/bootstrap-schemes/<scheme>/buckets.csv` с полями
+   `node_id,total_contacts,nonempty_buckets,bucket_index,contacts_in_bucket`.
+6. Пишет `results/2/bootstrap-schemes/<scheme>/summary.json` с полями
+   `scheme`, `N`, `K`, `alpha`, `avg_contacts`, `avg_nonempty_buckets`,
+   `nondegeneracy_pass`.
+
+`scripts/compare_bootstrap_schemes.sh` сводит четыре `summary.json` в
+`results/2/bootstrap-schemes/bootstrap-comparison.txt` (tab-separated,
+выровнено `column -t`). Результат на `N=20, K=4, ALPHA=3`: все 4 схемы
+`nondegeneracy_pass=true`, avg contacts 4.65–5.05, avg non-empty
+buckets 2.70–2.95.
 
 ---
 
@@ -850,11 +1060,18 @@ seed-узел убивается, и повторный lookup выполняе�
 1. проверяет локальное хранилище;
 2. иначе — итеративный `FIND_VALUE` (`internal/dht/find_value.go`);
 3. `FindValue` не останавливается на первой найденной записи: он
-   добирает до `k` ближайших, чтобы обнаружить более новую версию
-   у другого хранителя;
+   добирает до `k` **ответивших**, чтобы обнаружить более новую
+   версию у другого хранителя;
 4. возвращает найденную валидную запись с **наибольшим**
    `sequence_number` из собранных. При равенстве `sequence_number`
    возвращается первая найденная.
+
+`FindValue.Run` использует ту же структуру `candidateSet`
+(`byID` / `responded` / `failed`) и то же условие остановки по
+`respondedClosest(k)`, что и `Lookup`. Возвращает `FindValueResult`
+с полями `Key`, `Success`, `Record`, `Closest`, `RPCs`, `Iterations`,
+`Timeouts`, `Responded`, `DurationMs`, `Trace`, `Discovered`.
+`node.Get` обрабатывает `Discovered` через `observeAsync`.
 
 ### 16.3. Обработка `STORE_REQUEST`
 
@@ -862,7 +1079,7 @@ seed-узел убивается, и повторный lookup выполняе�
 
 1. декодирует payload строго;
 2. проверяет контакт отправителя через `routing.FromWire`;
-3. обрабатывает контакт отправителя через `node.observe`;
+3. обрабатывает контакт отправителя через `observeAsync`;
 4. вызывает `store.Put(record)`, что включает `Validate(now, prev)`;
 5. возвращает `STORE_RESPONSE` с `Stored=true` либо `Stored=false`
    и текстом ошибки.
@@ -879,6 +1096,9 @@ seed-узел убивается, и повторный lookup выполняе�
 Отправитель проверяется только на структурную корректность контакта
 (`routing.FromWire`) и на то, что он не ломает `RoutingTable`.
 
+Если контакт отправителя структурно некорректен — `ERROR` и
+закрытие соединения. Покрыто `TestStoreRejectsBadSenderContact`.
+
 ### 16.4. Обработка `FIND_VALUE_REQUEST`
 
 Получив `FIND_VALUE_REQUEST`, узел:
@@ -886,7 +1106,7 @@ seed-узел убивается, и повторный lookup выполняе�
 1. декодирует payload строго;
 2. проверяет длину `key` (ровно 32 байта);
 3. проверяет контакт отправителя;
-4. обрабатывает контакт отправителя через `node.observe`;
+4. обрабатывает контакт отправителя через `observeAsync`;
 5. если `key` есть в локальном хранилище — **повторно проверяет
    `rec.Verify()`** перед возвратом (защита в глубину: `Store.Put`
    уже проверяет подпись, но если запись попала в хранилище в
@@ -899,6 +1119,9 @@ seed-узел убивается, и повторный lookup выполняе�
 
 Ответ всегда одного типа `FIND_VALUE_RESPONSE`: либо с `record`,
 либо с `contacts`.
+
+Если контакт отправителя структурно некорректен — `ERROR` и
+закрытие соединения. Покрыто `TestFindValueRejectsBadSenderContact`.
 
 ### 16.5. Переопубликование и TTL
 
@@ -936,6 +1159,11 @@ seed-узел убивается, и повторный lookup выполняе�
 1. нормализует псевдоним;
 2. вычисляет `AliasKey(normalized)`;
 3. вызывает `Get(ctx, key)`.
+
+Для теста `TestAliasLastWriterWins` добавлен
+`Node.BuildSelfRecordWithSeq(seq uint64)`: строит запись через
+`BuildSelfRecord`, перезаписывает `SequenceNumber` и переподписывает.
+Это даёт детерминированный `SequenceNumber` без `time.Sleep`.
 
 Ограничения псевдонимов:
 
@@ -978,7 +1206,10 @@ seed-узел убивается, и повторный lookup выполняе�
 | `MAX_FRAME_PAYLOAD` = 65536, проверка до выделения | §4.2 |
 | Типы `PING`, `PONG`, `FIND_NODE_*`, `STORE_*`, `FIND_VALUE_*`, `ERROR` | §5 |
 | Строгая сериализация payload | §6 |
+| Таймауты чтения и записи | §3.2 |
+| Учёт соединений и корректный `Stop()` | §3.4 |
 | `NodeID = SHA-256(canonical_encode(pub))` | §7.2 |
+| Сверка `pub`/`priv` при `load` | §7.3 |
 | Ed25519, хранение ключей в state_dir | §7.1 |
 | Формат контакта | §8 |
 | Локальные метки времени | §8.2 |
@@ -986,22 +1217,30 @@ seed-узел убивается, и повторный lookup выполняе�
 | k-bucket с ёмкостью `k`, LRU-порядок | §10.1, §10.2 |
 | Потокобезопасность таблицы | §10.3 |
 | Вытеснение LRU только после `PING` | §10.4 |
+| Обновление адреса контакта через `TouchOrUpdate` и `PING` | §10.4 |
+| Ограничение фоновых LRU-проверок | §10.5 |
 | `PING` / `FIND_NODE` как RPC | §12, §13 |
+| Валидация `PONG` (`FromWire`, `NodeID`, эхо) | §12.2 |
+| Отклонение bad sender | §12.1, §13.1, §16.3, §16.4 |
 | Итеративный lookup с `ALPHA` | §14 |
+| Состояния `discovered` / `responded` / `failed` | §14.2 |
+| Условие остановки по `responded.closest(k)` | §14.2 |
 | Отсутствие доступа `dht.Lookup` / `dht.FindValue` к `RoutingTable` | §14.3 |
 | Bootstrap через seed + self-lookup | §15.1, §15.2 |
 | Четыре bootstrap-схемы | §15.3, §15.4 |
 | Seed self-lookup для multi-seed | §15.5 |
 | Отказ seed не блокирует lookup | §15.6 |
 | Автоматическая проверка невырожденности | §15.7 |
-| `NodeRecord` с каноническим представлением и подписью | §7.5, §16 |
+| Артефакты bootstrap-схем | §15.7 |
+| Валидация конфигурации и env | §11 |
+| `NodeRecord` с каноническим представлением и подписью | §7.6, §16 |
 | `STORE` / `FIND_VALUE` | §16 |
 | Репликация `R = 3`, `acks >= 2` | §16.1 |
 | Отказ хранителя | §16.2 |
 | TTL и защита от отката | §16.3, §16.5 |
 | Переопубликование владельцем | §16.5 |
 | Псевдонимы с нормализацией | §16.6 |
-| Ограничения этапа 3 (нет TLS, нет глобальной согласованности) | §7.4, §17 |
+| Ограничения этапа 3 (нет TLS, нет глобальной согласованности) | §7.5, §17 |
 
 ---
 
@@ -1019,5 +1258,5 @@ seed-узел убивается, и повторный lookup выполняе�
 | Узел | `internal/node/node.go`, `internal/node/lookup.go`, `internal/node/store_handlers.go`, `internal/node/dht_ops.go`, `internal/node/republish.go`, `internal/node/alias.go` |
 | CLI | `cmd/node/main.go` |
 | Конфигурация | `internal/config/config.go` |
-| Сценарии | `scripts/demo.sh`, `scripts/lookup.sh`, `scripts/bench.sh`, `scripts/check_non_degenerate.sh`, `scripts/store_experiment.sh` |
+| Сценарии | `scripts/demo.sh`, `scripts/lookup.sh`, `scripts/bench.sh`, `scripts/check_non_degenerate.sh`, `scripts/bootstrap_schemes.sh`, `scripts/compare_bootstrap_schemes.sh`, `scripts/store_experiment.sh` |
 | Документы | `docs/Architecture.md`, `docs/Node record.md`, `docs/Serialization comparison.md`, `docs/sprints/1.md`, `docs/sprints/2.md`, `docs/sprints/3.md` |

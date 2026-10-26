@@ -15,7 +15,7 @@ RUNS=${RUNS:-30}
 READY_TIMEOUT=${READY_TIMEOUT:-60}
 DUMP_TIMEOUT=${DUMP_TIMEOUT:-15}
 LOOKUP_TIMEOUT=${LOOKUP_TIMEOUT:-20}
-RESULTS_DIR=${RESULTS_DIR:-results}
+RESULTS_DIR=${RESULTS_DIR:-results/2}
 HOLD=${HOLD:-0}
 
 case "$SCHEME" in
@@ -44,10 +44,10 @@ TXT="$RESULTS_DIR/${SCHEME}-lookups.txt"
 PIDS=()
 cleanup() {
   if [ "$HOLD" -eq 1 ]; then
-    echo "==> HOLD=1: network left running, PIDs: ${PIDS[*]:-}"
+    echo "HOLD=1: network left running, PIDs: ${PIDS[*]:-}"
     return
   fi
-  echo "==> stopping network"
+  echo "stopping network"
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
@@ -55,13 +55,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> building"
+echo "building"
 go build -o bin/node ./cmd/node
 
 rm -rf "$STATE"
 mkdir -p "$CONFIGS" "$DUMPS" "$READY"
 
-echo "==> scheme=${SCHEME} nodes=${NODES} base_port=${BASE_PORT} k=${K}"
+echo "scheme=${SCHEME} nodes=${NODES} base_port=${BASE_PORT} k=${K}"
 for i in $(seq 1 "$NODES"); do
   port=$((BASE_PORT + i - 1))
   cfg=$CONFIGS/node-$(printf '%02d' "$i").json
@@ -122,7 +122,7 @@ for i in $(seq 1 "$NODES"); do
 EOF
 done
 
-echo "==> starting nodes"
+echo "starting nodes"
 for i in $(seq 1 "$NODES"); do
   id=$(printf '%02d' "$i")
   cfg=$CONFIGS/node-${id}.json
@@ -138,11 +138,11 @@ for i in $(seq 1 "$NODES"); do
 
   pid=$!
   PIDS+=("$pid")
-  echo "  node-${id} pid=${pid} port=$((BASE_PORT + i - 1))"
+  echo "node-${id} pid=${pid} port=$((BASE_PORT + i - 1))"
   sleep 0.3
 done
 
-echo "==> waiting for readiness (timeout ${READY_TIMEOUT}s)"
+echo "waiting for readiness (timeout ${READY_TIMEOUT}s)"
 dl=$(( $(date +%s) + READY_TIMEOUT ))
 while true; do
   cnt=0
@@ -150,26 +150,26 @@ while true; do
     [ -f "$READY/node-$(printf '%02d' "$i")" ] && cnt=$((cnt + 1))
   done
   if [ "$cnt" -eq "$NODES" ]; then
-    echo "  all ${NODES} nodes ready"
+    echo "all ${NODES} nodes ready"
     break
   fi
   if [ "$(date +%s)" -ge "$dl" ]; then
-    echo "  WARNING: only ${cnt}/${NODES} ready; continuing"
+    echo "WARNING: only ${cnt}/${NODES} ready; continuing"
     break
   fi
   sleep 0.2
 done
 
-echo "==> waiting for initial dumps"
+echo "waiting for initial dumps"
 dl=$(( $(date +%s) + DUMP_TIMEOUT ))
 while true; do
   cnt=$(ls -1 "$DUMPS"/routing-*-initial.json 2>/dev/null | wc -l)
   if [ "$cnt" -ge "$NODES" ]; then
-    echo "  got ${cnt} initial dumps"
+    echo "got ${cnt} initial dumps"
     break
   fi
   if [ "$(date +%s)" -ge "$dl" ]; then
-    echo "  WARNING: only ${cnt}/${NODES} dumps; continuing"
+    echo "WARNING: only ${cnt}/${NODES} dumps; continuing"
     break
   fi
   sleep 0.2
@@ -229,7 +229,7 @@ run_one_lookup() {
   local dl=$(( $(date +%s) + LOOKUP_TIMEOUT ))
   while [ ! -f "$done_path" ]; do
     if [ "$(date +%s)" -ge "$dl" ]; then
-      echo "  WARN: lookup timeout for $init_name" >&2
+      echo "WARN: lookup timeout for $init_name" >&2
       return 1
     fi
     sleep 0.2
@@ -239,13 +239,13 @@ run_one_lookup() {
   return 0
 }
 
-echo "==> running ${RUNS} lookups on scheme=${SCHEME}"
+echo "running ${RUNS} lookups on scheme=${SCHEME}"
 echo "run,initiator,target,success,rpcs,iters,timeouts,duration_ms,closest" > "$CSV"
 
 ok=0
 for run in $(seq 1 "$RUNS"); do
   if ! select_random_pair; then
-    echo "  run=${run}: no suitable pair, skipping" >&2
+    echo "run=${run}: no suitable pair, skipping" >&2
     continue
   fi
 
@@ -276,25 +276,24 @@ for run in $(seq 1 "$RUNS"); do
   echo "${run},${INIT_NAME},${TGT_NAME},${success},${rpcs},${iters},${timeouts},${duration},${closest}" >> "$CSV"
   [ "$success" = "true" ] && ok=$((ok + 1))
 
-  printf "  run=%-3s init=%-8s tgt=%-8s success=%-5s rpcs=%-3s iters=%-3s dur=%sms\n" \
+  printf "run=%-3s init=%-8s tgt=%-8s success=%-5s rpcs=%-3s iters=%-3s dur=%sms\n" \
     "$run" "$INIT_NAME" "$TGT_NAME" "$success" "$rpcs" "$iters" "$duration"
 done
 
-echo
-echo "==> summary: ${ok}/${RUNS} successful"
+echo "summary: ${ok}/${RUNS} successful"
 {
   echo "scheme=${SCHEME} nodes=${NODES} runs=${RUNS} ok=${ok}"
   echo
   echo "raw CSV: $CSV"
   echo
-  echo "--- per-run ---"
+  echo "per-run"
   if command -v column >/dev/null 2>&1; then
     column -t -s, "$CSV"
   else
     cat "$CSV"
   fi
   echo
-  echo "--- aggregates ---"
+  echo "aggregates"
   awk -F, 'NR>1 && $4=="true" {
       n++;
       sum_rpcs  += $5;
@@ -316,8 +315,7 @@ echo "==> summary: ${ok}/${RUNS} successful"
   }' "$CSV"
 } | tee "$TXT"
 
-echo
-echo "==> artifacts"
+echo "artifacts"
 echo "  csv:     $CSV"
 echo "  summary: $TXT"
 echo "  state:   $STATE"

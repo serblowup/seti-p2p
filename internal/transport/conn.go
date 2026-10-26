@@ -10,6 +10,15 @@ import (
 )
 
 func WriteFrame(conn net.Conn, f *protocol.Frame) error {
+	return WriteFrameWithDeadline(conn, f, 0)
+}
+
+func WriteFrameWithDeadline(conn net.Conn, f *protocol.Frame, timeout time.Duration) error {
+	if timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+	}
 	buf := f.Marshal()
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)

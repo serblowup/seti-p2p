@@ -16,7 +16,7 @@ READER_SETTLE=${READER_SETTLE:-5}
 READY_TIMEOUT=${READY_TIMEOUT:-60}
 DUMP_TIMEOUT=${DUMP_TIMEOUT:-15}
 KILL_REPLICA=${KILL_REPLICA:-1}
-RESULTS_DIR=${RESULTS_DIR:-results}
+RESULTS_DIR=${RESULTS_DIR:-results/3}
 
 case "$SCHEME" in
   star|ring|tree|multi-seed) ;;
@@ -381,7 +381,6 @@ else
   non_victim_success=$(awk -F, 'NR>1 && $5=="true" {n++} END{print n+0}' "$CSV")
 fi
 
-echo
 echo "summary: ${ok}/${RUNS} successful"
 {
   echo "scheme=${SCHEME} nodes=${NODES} runs=${RUNS} ok=${ok}"

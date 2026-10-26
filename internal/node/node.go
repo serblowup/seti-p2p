@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"seti-p2p/internal/config"
@@ -19,6 +20,8 @@ import (
 	"seti-p2p/internal/store"
 	"seti-p2p/internal/transport"
 )
+
+const MaxBackgroundLRUChecks = 4
 
 type Node struct {
 	cfg    config.Config
@@ -35,6 +38,14 @@ type Node struct {
 	stopOnce sync.Once
 
 	baseCtx context.Context
+	cancel  context.CancelFunc
+
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
+	connWG  sync.WaitGroup
+
+	lruCheckSem      chan struct{}
+	lruChecksInFlight int32
 }
 
 func New(cfg config.Config) (*Node, error) {
@@ -53,16 +64,19 @@ func New(cfg config.Config) (*Node, error) {
 	}
 
 	return &Node{
-		cfg:    cfg,
-		id:     id,
-		nodeID: nid,
-		table:  routing.NewRoutingTable(nid, cfg.KBucketSize),
-		store:  store.New(storePath),
+		cfg:         cfg,
+		id:          id,
+		nodeID:      nid,
+		table:       routing.NewRoutingTable(nid, cfg.KBucketSize),
+		store:       store.New(storePath),
+		conns:       make(map[net.Conn]struct{}),
+		lruCheckSem: make(chan struct{}, MaxBackgroundLRUChecks),
 		rpcClient: transport.RPCClient{
 			ProtoVersion: cfg.ProtocolVersion,
 			MaxPayload:   cfg.MaxFramePayload,
 			ConnectTO:    time.Duration(cfg.ConnectTimeoutMs) * time.Millisecond,
 			ReadTO:       time.Duration(cfg.ReadTimeoutMs) * time.Millisecond,
+			WriteTO:      time.Duration(cfg.WriteTimeoutMs) * time.Millisecond,
 		},
 	}, nil
 }
@@ -79,6 +93,10 @@ func (n *Node) StoreSize() int { return n.store.Size() }
 
 func (n *Node) StoreGet(key []byte) (*store.NodeRecord, bool) {
 	return n.store.Get(key)
+}
+
+func (n *Node) LRUChecksInFlight() int32 {
+	return atomic.LoadInt32(&n.lruChecksInFlight)
 }
 
 func (n *Node) SelfContact() (routing.Contact, error) {
@@ -119,15 +137,22 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	n.ln = ln
 	n.started = true
-	n.baseCtx = ctx
+	n.baseCtx, n.cancel = context.WithCancel(ctx)
 	n.mu.Unlock()
 
 	log.Printf("node %s listening on %s (contacts=%d, records=%d)",
 		shortID(n.nodeID), addr, n.table.TotalContacts(), n.store.Size())
 
-	go n.acceptLoop(ctx)
-	go n.runMaintenance(ctx)
+	go n.acceptLoop(n.baseCtx)
+	go n.runMaintenance(n.baseCtx)
+	go n.watchCtx(n.baseCtx, ln)
 	return nil
+}
+
+func (n *Node) watchCtx(ctx context.Context, ln net.Listener) {
+	<-ctx.Done()
+	_ = ln.Close()
+	n.closeConns()
 }
 
 func (n *Node) Stop() {
@@ -136,11 +161,17 @@ func (n *Node) Stop() {
 			log.Printf("node %s: save dht-store: %v", shortID(n.nodeID), err)
 		}
 		n.mu.Lock()
+		cancel := n.cancel
 		ln := n.ln
 		n.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		if ln != nil {
 			_ = ln.Close()
 		}
+		n.closeConns()
+		n.connWG.Wait()
 	})
 }
 
@@ -159,12 +190,16 @@ func (n *Node) acceptLoop(ctx context.Context) {
 			log.Printf("node %s: accept error: %v", shortID(n.nodeID), err)
 			continue
 		}
+		n.connWG.Add(1)
 		go n.handleConn(conn)
 	}
 }
 
 func (n *Node) handleConn(conn net.Conn) {
+	defer n.connWG.Done()
+	defer n.unregisterConn(conn)
 	defer conn.Close()
+	n.registerConn(conn)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(
 			time.Duration(n.cfg.ReadTimeoutMs) * time.Millisecond))
@@ -179,20 +214,48 @@ func (n *Node) handleConn(conn net.Conn) {
 				Code:    "handler_error",
 				Message: sanitizeErr(err),
 			})
-			_ = transport.WriteFrame(conn, &protocol.Frame{
+			_ = transport.WriteFrameWithDeadline(conn, &protocol.Frame{
 				Version:   n.cfg.ProtocolVersion,
 				Type:      protocol.TypeError,
 				RequestID: frame.RequestID,
 				Payload:   ep,
-			})
+			}, n.writeTimeout())
 			return
 		}
 		if resp == nil {
 			continue
 		}
-		if err := transport.WriteFrame(conn, resp); err != nil {
+		if err := transport.WriteFrameWithDeadline(conn, resp, n.writeTimeout()); err != nil {
 			return
 		}
+	}
+}
+
+func (n *Node) writeTimeout() time.Duration {
+	return time.Duration(n.cfg.WriteTimeoutMs) * time.Millisecond
+}
+
+func (n *Node) registerConn(conn net.Conn) {
+	n.connsMu.Lock()
+	n.conns[conn] = struct{}{}
+	n.connsMu.Unlock()
+}
+
+func (n *Node) unregisterConn(conn net.Conn) {
+	n.connsMu.Lock()
+	delete(n.conns, conn)
+	n.connsMu.Unlock()
+}
+
+func (n *Node) closeConns() {
+	n.connsMu.Lock()
+	conns := make([]net.Conn, 0, len(n.conns))
+	for c := range n.conns {
+		conns = append(conns, c)
+	}
+	n.connsMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
 	}
 }
 
@@ -220,7 +283,7 @@ func (n *Node) handlePing(f *protocol.Frame) (*protocol.Frame, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad sender contact: %w", err)
 	}
-	n.observe(sender)
+	n.observeAsync(sender)
 
 	self, err := n.SelfContact()
 	if err != nil {
@@ -254,7 +317,7 @@ func (n *Node) handleFindNode(f *protocol.Frame) (*protocol.Frame, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad sender contact: %w", err)
 	}
-	n.observe(sender)
+	n.observeAsync(sender)
 
 	nearest := n.table.Nearest(req.TargetNodeID, n.cfg.KBucketSize)
 	contacts := make([]protocol.ContactWire, 0, len(nearest))
@@ -288,9 +351,63 @@ func (n *Node) handleFindNode(f *protocol.Frame) (*protocol.Frame, error) {
 	}, nil
 }
 
-func (n *Node) observe(c routing.Contact) {
-	checkLRU, lru, err := n.table.Observe(c)
+func (n *Node) observeAsync(c routing.Contact) {
+	checkLRU, lru, addressChanged, oldContact, err := n.table.Observe(c)
 	if err != nil {
+		return
+	}
+	if !checkLRU && !addressChanged {
+		return
+	}
+	go n.maintainBucket(checkLRU, c, lru, addressChanged, oldContact)
+}
+
+func (n *Node) observeSync(c routing.Contact) {
+	checkLRU, lru, addressChanged, oldContact, err := n.table.Observe(c)
+	if err != nil {
+		return
+	}
+	if !checkLRU && !addressChanged {
+		return
+	}
+	n.maintainBucketBlocking(checkLRU, c, lru, addressChanged, oldContact)
+}
+
+func (n *Node) ObserveContact(c routing.Contact) error {
+	if c.Host == "" || c.Port == 0 || len(c.NodeID) != 32 {
+		return errors.New("observe: invalid contact")
+	}
+	n.observeSync(c)
+	return nil
+}
+
+func (n *Node) maintainBucket(checkLRU bool, c, lru routing.Contact, addressChanged bool, oldContact routing.Contact) {
+	select {
+	case n.lruCheckSem <- struct{}{}:
+	default:
+		return
+	}
+	defer func() { <-n.lruCheckSem }()
+	atomic.AddInt32(&n.lruChecksInFlight, 1)
+	defer atomic.AddInt32(&n.lruChecksInFlight, -1)
+	n.doMaintain(checkLRU, c, lru, addressChanged, oldContact)
+}
+
+func (n *Node) maintainBucketBlocking(checkLRU bool, c, lru routing.Contact, addressChanged bool, oldContact routing.Contact) {
+	atomic.AddInt32(&n.lruChecksInFlight, 1)
+	defer atomic.AddInt32(&n.lruChecksInFlight, -1)
+	n.doMaintain(checkLRU, c, lru, addressChanged, oldContact)
+}
+
+func (n *Node) doMaintain(checkLRU bool, c, lru routing.Contact, addressChanged bool, oldContact routing.Contact) {
+	if addressChanged {
+		if n.pingContact(c) {
+			n.table.TouchVerified(c.NodeID, c.LastVerifiedMs)
+		} else {
+			n.table.ReplaceIfDead(c.NodeID, oldContact)
+			log.Printf("observe: reverting address for %s to %s:%d",
+				shortID(c.NodeID), oldContact.Host, oldContact.Port)
+		}
 		return
 	}
 	if !checkLRU {
@@ -315,9 +432,10 @@ func (n *Node) pingContact(c routing.Contact) bool {
 	if err != nil {
 		return false
 	}
+	pingTS := nowMs()
 	payload, err := protocol.EncodePayload(protocol.PingPayload{
 		Sender:      self.ToWire(),
-		TimestampMs: nowMs(),
+		TimestampMs: pingTS,
 	})
 	if err != nil {
 		return false
@@ -336,7 +454,22 @@ func (n *Node) pingContact(c routing.Contact) bool {
 	if err != nil {
 		return false
 	}
-	if _, err := protocol.DecodePong(resp.Payload); err != nil {
+	p, err := protocol.DecodePong(resp.Payload)
+	if err != nil {
+		return false
+	}
+	responder, err := routing.FromWire(p.Responder)
+	if err != nil {
+		log.Printf("ping: bad responder contact from %s: %v", shortID(c.NodeID), err)
+		return false
+	}
+	if !bytesEqual(responder.NodeID, c.NodeID) {
+		log.Printf("ping: responder node_id mismatch expected=%s got=%s",
+			shortID(c.NodeID), shortID(responder.NodeID))
+		return false
+	}
+	if p.PingTimestampMs != pingTS {
+		log.Printf("ping: timestamp echo mismatch from %s", shortID(c.NodeID))
 		return false
 	}
 	c.MarkVerified()
@@ -349,9 +482,10 @@ func (n *Node) Ping(peer routing.Contact) (routing.Contact, error) {
 	if err != nil {
 		return routing.Contact{}, err
 	}
+	pingTS := nowMs()
 	payload, err := protocol.EncodePayload(protocol.PingPayload{
 		Sender:      self.ToWire(),
-		TimestampMs: nowMs(),
+		TimestampMs: pingTS,
 	})
 	if err != nil {
 		return routing.Contact{}, err
@@ -382,7 +516,18 @@ func (n *Node) Ping(peer routing.Contact) (routing.Contact, error) {
 	if err != nil {
 		return routing.Contact{}, err
 	}
-	return routing.FromWire(p.Responder)
+	responder, err := routing.FromWire(p.Responder)
+	if err != nil {
+		return routing.Contact{}, fmt.Errorf("ping: bad responder contact: %w", err)
+	}
+	if !bytesEqual(responder.NodeID, peer.NodeID) {
+		return routing.Contact{}, fmt.Errorf("ping: responder node_id mismatch expected=%s got=%s",
+			shortID(peer.NodeID), shortID(responder.NodeID))
+	}
+	if p.PingTimestampMs != pingTS {
+		return routing.Contact{}, errors.New("ping: timestamp echo mismatch")
+	}
+	return responder, nil
 }
 
 func (n *Node) Bootstrap(ctx context.Context) error {
@@ -416,9 +561,10 @@ func (n *Node) bootstrapPing(ctx context.Context, host string, port uint16) erro
 	if err != nil {
 		return err
 	}
+	pingTS := nowMs()
 	payload, err := protocol.EncodePayload(protocol.PingPayload{
 		Sender:      self.ToWire(),
-		TimestampMs: nowMs(),
+		TimestampMs: pingTS,
 	})
 	if err != nil {
 		return err
@@ -440,7 +586,7 @@ func (n *Node) bootstrapPing(ctx context.Context, host string, port uint16) erro
 	}
 	defer conn.Close()
 
-	if err := transport.WriteFrame(conn, req); err != nil {
+	if err := transport.WriteFrameWithDeadline(conn, req, n.writeTimeout()); err != nil {
 		return err
 	}
 	resp, err := transport.ReadFrameWithDeadline(conn,
@@ -467,9 +613,27 @@ func (n *Node) bootstrapPing(ctx context.Context, host string, port uint16) erro
 	if err != nil {
 		return fmt.Errorf("bad responder contact: %w", err)
 	}
-	n.observe(c)
+	if bytesEqual(c.NodeID, n.nodeID) {
+		return errors.New("bootstrap: responder node_id matches self")
+	}
+	if p.PingTimestampMs != pingTS {
+		return errors.New("bootstrap: timestamp echo mismatch")
+	}
+	n.observeAsync(c)
 	log.Printf("node %s: bootstrapped via %s", shortID(n.nodeID), shortID(c.NodeID))
 	return nil
+}
+
+func (n *Node) BuildSelfRecordWithSeq(seq uint64) (*store.NodeRecord, error) {
+	rec, err := n.BuildSelfRecord()
+	if err != nil {
+		return nil, err
+	}
+	rec.SequenceNumber = seq
+	if err := rec.Sign(n.id.Priv); err != nil {
+		return nil, err
+	}
+	return rec, nil
 }
 
 type RoutingTableDump struct {
@@ -536,8 +700,8 @@ func sanitizeErr(err error) string {
 		return ""
 	}
 	msg := err.Error()
-	if len(msg) > 200 {
-		msg = msg[:200]
+	if len(msg) > 500 {
+		msg = msg[:500]
 	}
 	return msg
 }

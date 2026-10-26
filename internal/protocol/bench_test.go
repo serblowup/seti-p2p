@@ -1,7 +1,6 @@
 package protocol_test
 
 import (
-	"encoding/json"
 	"testing"
 
 	"seti-p2p/internal/protocol"
@@ -49,7 +48,7 @@ func BenchmarkPing_JSON_Encode(b *testing.B) {
 	p := mkPing()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := json.Marshal(p); err != nil {
+		if _, err := protocol.EncodePayload(p); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -77,11 +76,10 @@ func BenchmarkPing_CBOR_Encode(b *testing.B) {
 
 func BenchmarkPing_JSON_Decode(b *testing.B) {
 	p := mkPing()
-	raw, _ := json.Marshal(p)
+	raw, _ := protocol.EncodePayload(p)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var got protocol.PingPayload
-		if err := json.Unmarshal(raw, &got); err != nil {
+		if _, err := protocol.DecodePing(raw); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -115,7 +113,7 @@ func BenchmarkFindNode_JSON_Encode(b *testing.B) {
 	p := mkFindNodeResp(3)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(p)
+		_, _ = protocol.EncodePayload(p)
 	}
 }
 
@@ -137,11 +135,12 @@ func BenchmarkFindNode_CBOR_Encode(b *testing.B) {
 
 func BenchmarkFindNode_JSON_Decode(b *testing.B) {
 	p := mkFindNodeResp(3)
-	raw, _ := json.Marshal(p)
+	raw, _ := protocol.EncodePayload(p)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var got protocol.FindNodeResponsePayload
-		_ = json.Unmarshal(raw, &got)
+		if _, err := protocol.DecodeFindNodeResponse(raw); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -170,15 +169,15 @@ func TestSerializationSizes(t *testing.T) {
 	fnr := mkFindNodeResp(3)
 	errp := mkError()
 
-	jsonPing, _ := json.Marshal(p)
+	jsonPing, _ := protocol.EncodePayload(p)
 	msgPing, _ := protocol.EncodeMsgpack(p)
 	cborPing, _ := protocol.EncodeCBOR(p)
 
-	jsonFNR, _ := json.Marshal(fnr)
+	jsonFNR, _ := protocol.EncodePayload(fnr)
 	msgFNR, _ := protocol.EncodeMsgpack(fnr)
 	cborFNR, _ := protocol.EncodeCBOR(fnr)
 
-	jsonErr, _ := json.Marshal(errp)
+	jsonErr, _ := protocol.EncodePayload(errp)
 	msgErr, _ := protocol.EncodeMsgpack(errp)
 	cborErr, _ := protocol.EncodeCBOR(errp)
 

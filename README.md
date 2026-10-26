@@ -22,17 +22,26 @@ bootstrap-схемы).
 - TCP-сервер и клиент с собственным кадрированием (24-байтовый заголовок).
 - Строгая JSON-сериализация payload с `DisallowUnknownFields`.
 - Долговременная идентичность на Ed25519, `NodeID = SHA-256(DER SPKI)`.
+- Сверка публичного ключа, выведенного из закрытого, с загруженным
+  `identity.pub`; при несовпадении узел не стартует.
 - Ограниченная таблица маршрутизации Kademlia из 256 k-bucket.
 - Операции `PING`, `PONG`, `FIND_NODE_REQUEST`, `FIND_NODE_RESPONSE`.
-- Итеративный lookup с параллелизмом `ALPHA = 3`.
+- Валидация `PONG` (`FromWire`, `NodeID` отвечающего, эхо `PingTimestampMs`).
+- Отклонение bad sender в `PING`/`FIND_NODE` с `ERROR` и закрытием соединения.
+- Итеративный lookup с параллелизмом `ALPHA = 3`; отдельные состояния
+  `discovered` / `responded` / `failed`; `failed` не опрашиваются повторно.
 - Bootstrap через seed-узел с последующим self-lookup.
 - Четыре схемы начального подключения: `star`, `ring`, `tree`, `multi-seed`.
 - Seed self-lookup для ускорения сходимости в `multi-seed`.
-- LRU-вытеснение контактов с `PING` перед заменой.
+- LRU-вытеснение контактов с `PING` перед заменой; обслуживание bucket
+  вынесено в фоновые `maintainBucket` с семафором `MaxBackgroundLRUChecks=4`.
+- Обновление адреса контакта через `TouchOrUpdate` с подтверждением по `PING`
+  и откатом на старый адрес при неудаче.
 - Автоматическая проверка невырожденности DHT.
 - Сценарий отказа seed.
 - Серия контрольных lookup и сбор метрик в CSV.
 - Сравнение форматов сериализации JSON / MessagePack / CBOR.
+- Сохранение артефактов по этапам: `results/1/`, `results/2/`, `results/3/`.
 
 ### Этап 3
 
@@ -62,10 +71,15 @@ bootstrap-схемы).
 ## 2. Требования
 
 - **Go** 1.27 (`go.mod`: `go 1.27.0`).
-- **jq** — для разбора JSON-дампов в скриптах.
+- **jq** — для разбора JSON-дампов в скриптах
+  (`demo.sh`, `lookup.sh`, `check_non_degenerate.sh`,
+  `bootstrap_schemes.sh`, `compare_bootstrap_schemes.sh`,
+  `store_experiment.sh`).
 - **bash** 4+ — для скриптов демонстрации и экспериментов.
 - **Linux** или **macOS** — скрипты используют `mapfile`, `shuf`,
   `date +%s%N`.
+- (Опционально) **column** (util-linux) — для выравнивания
+  `bootstrap-comparison.txt`; при отсутствии используется `cat`.
 - (Опционально) **OpenSSL** — для внешней проверки сертификатов.
 - (Опционально) **Docker** и **docker-compose** — не используются на
   этапах 1–3, но заготовлены для будущих этапов.
@@ -90,8 +104,14 @@ go test ./tests/unit/... -v
 go test ./tests/integration/... -v
 ```
 
-Ожидаемый результат: **68 unit-тестов** и **24 integration-теста**
-проходят без ошибок.
+Ожидаемый результат: **78 unit-тестов** и **38 integration-тестов**
+проходят без ошибок (числа актуальны после доработок этапов 1–2).
+Точные числа можно получить:
+
+```bash
+go test ./tests/unit/ -v | grep -c '^--- PASS'
+go test ./tests/integration/ -v | grep -c '^--- PASS'
+```
 
 ---
 
@@ -114,7 +134,7 @@ NODES=5 K=3 SCHEME=star ./scripts/demo.sh
 6. Выбирает пару «инициатор — цель», где цель отсутствует в таблице
    инициатора.
 7. Запускает `FIND_NODE` и печатает результат.
-8. Проверяет невырожденность DHT.
+8. Проверяет невырожденность DHT (результат в `results/2/star-nondegeneracy.json`).
 9. Убивает seed-узел и повторяет lookup.
 10. Печатает сводку таблиц.
 
@@ -144,7 +164,9 @@ NODES=20 K=4 SCHEME=multi-seed ./scripts/demo.sh
 
 - создаёт каталог `state-<scheme>/` с конфигами, логами, дампами;
 - печатает `PASS: DHT is non-degenerate` или `FAIL`;
-- печатает результат lookup и post-failure lookup.
+- печатает результат lookup и post-failure lookup;
+- сохраняет результат проверки невырожденности в
+  `results/2/<scheme>-nondegeneracy.json`.
 
 ### 5.2. Серия контрольных lookup
 
@@ -157,8 +179,8 @@ NODES=20 K=4 SCHEME=multi-seed RUNS=30 ./scripts/lookup.sh
 
 Результаты сохраняются в:
 
-- `results/<scheme>-lookups.csv` — построчные данные;
-- `results/<scheme>-lookups.txt` — сводка с агрегатами.
+- `results/2/<scheme>-lookups.csv` — построчные данные;
+- `results/2/<scheme>-lookups.txt` — сводка с агрегатами.
 
 ### 5.3. Проверка невырожденности DHT
 
@@ -172,12 +194,40 @@ SCHEME=star NODES=20 ./scripts/check_non_degenerate.sh
 2. Ни у одного узла нет полного каталога.
 3. Не менее 80% узлов имеют ≥2 непустых bucket.
 
-Результат сохраняется в `results/<scheme>-nondegeneracy.json`.
+Результат сохраняется в `results/2/<scheme>-nondegeneracy.json`.
 
 Если число дампов не совпадает с `NODES`, скрипт завершается с
 `exit 2` — это защита от ложного PASS при неполном наборе данных.
 
-### 5.4. Сравнение форматов сериализации
+### 5.4. Bootstrap-схемы и артефакты
+
+```bash
+NODES=20 K=4 ALPHA=3 ./scripts/bootstrap_schemes.sh
+./scripts/compare_bootstrap_schemes.sh
+cat results/2/bootstrap-schemes/bootstrap-comparison.txt
+```
+
+Для каждой из четырёх схем (`star`, `ring`, `tree`, `multi-seed`)
+скрипт `bootstrap_schemes.sh`:
+
+1. Поднимает сеть `N=20, K=4, ALPHA=3`.
+2. Ждёт готовности всех узлов.
+3. Снимает initial-дампы таблиц маршрутизации.
+4. Вызывает `check_non_degenerate.sh` (результат —
+   `results/2/bootstrap-schemes/<scheme>-nondegeneracy.json`).
+5. Копирует конфиги и дампы в
+   `results/2/bootstrap-schemes/<scheme>/{configs,dumps}/`.
+6. Строит `results/2/bootstrap-schemes/<scheme>/buckets.csv` с полями
+   `node_id,total_contacts,nonempty_buckets,bucket_index,contacts_in_bucket`.
+7. Пишет `results/2/bootstrap-schemes/<scheme>/summary.json` с полями
+   `scheme`, `N`, `K`, `alpha`, `avg_contacts`, `avg_nonempty_buckets`,
+   `nondegeneracy_pass`.
+
+`compare_bootstrap_schemes.sh` сводит четыре `summary.json` в
+`results/2/bootstrap-schemes/bootstrap-comparison.txt` (tab-separated,
+выровнено `column -t`).
+
+### 5.5. Сравнение форматов сериализации
 
 ```bash
 ./scripts/bench.sh
@@ -189,10 +239,15 @@ SCHEME=star NODES=20 ./scripts/check_non_degenerate.sh
 - `BenchmarkPing_*`, `BenchmarkFindNode_*` — скорости и аллокации
   (три прогона каждый).
 
-Результаты: `results/serialization-sizes.txt`,
-`results/serialization-bench.txt`.
+Бенчмарки JSON используют **реальный путь протокола**:
+`protocol.EncodePayload`, `protocol.DecodePing`,
+`protocol.DecodeFindNodeResponse`, а не прямой
+`json.Marshal`/`json.Unmarshal`.
 
-### 5.5. Эксперимент `STORE` / `FIND_VALUE`
+Результаты: `results/1/serialization-sizes.txt`,
+`results/1/serialization-bench.txt`.
+
+### 5.6. Эксперимент `STORE` / `FIND_VALUE`
 
 ```bash
 # Одна схема
@@ -223,8 +278,8 @@ done
    `victim_key=<short> reads=<N> success=<M>` — прямое
    подтверждение E3-5 из сырых данных.
 
-Результаты: `results/<scheme>-store.csv`,
-`results/<scheme>-store.txt`.
+Результаты: `results/3/<scheme>-store.csv`,
+`results/3/<scheme>-store.txt`.
 
 ---
 
@@ -244,6 +299,7 @@ done
   "connect_timeout_ms": 3000,
   "read_timeout_ms": 5000,
   "ping_timeout_ms": 5000,
+  "write_timeout_ms": 5000,
   "max_frame_payload": 65536,
   "protocol_version": 1,
   "log_level": "INFO",
@@ -261,13 +317,15 @@ done
 | `connect_timeout_ms` | Таймаут TCP-соединения |
 | `read_timeout_ms` | Таймаут чтения кадра |
 | `ping_timeout_ms` | Таймаут ожидания `PONG` |
+| `write_timeout_ms` | Таймаут записи кадра |
 | `max_frame_payload` | Максимальный размер payload (65536) |
 | `protocol_version` | Версия протокола (1) |
 | `ttl_seconds` | TTL записи DHT; переопубликование раз в `TTL/2` |
 
 Готовые конфиги для экспериментов генерируются автоматически
 скриптами `scripts/demo.sh`, `scripts/lookup.sh`,
-`scripts/store_experiment.sh` в каталоге `state-<scheme>/configs/`.
+`scripts/bootstrap_schemes.sh`, `scripts/store_experiment.sh`
+в каталоге `state-<scheme>/configs/`.
 
 ### Переопределение через переменные окружения
 
@@ -279,7 +337,13 @@ export SETI_BOOTSTRAP_PEERS=127.0.0.1:9101,127.0.0.1:9102
 export SETI_K_BUCKET_SIZE=4
 export SETI_ALPHA=3
 export SETI_TTL_SECONDS=180
+export SETI_WRITE_TIMEOUT_MS=5000
 ```
+
+Все значения `SETI_*` валидируются: нераспарсенное значение
+(`SETI_ALPHA=abc`, `SETI_LISTEN_PORT=70000`, `SETI_BOOTSTRAP_PEERS`
+без порта, `SETI_BOOTSTRAP_PEERS=127.0.0.1:abc` и т. п.) возвращает
+ошибку из `config.Load`, узел не стартует.
 
 ---
 
@@ -341,48 +405,99 @@ echo -n "6acf086a..." > state-star/node-02/lookup.trigger
 seti-p2p/
 ├── cmd/
 │   └── node/
-│       └── main.go               # точка входа
+│       └── main.go
 ├── docs/
-│   ├── Architecture.md           # архитектура и инженерные решения
-│   ├── Protocol.md               # спецификация протокола
-│   ├── Node record.md            # формат подписанной адресной записи
-│   ├── Serialization comparison.md # сравнение JSON / MsgPack / CBOR
+│   ├── Architecture.md
+│   ├── Protocol.md
+│   ├── Node record.md
+│   ├── Serialization comparison.md
 │   └── sprints/
-│       ├── 1.md                  # отчёт по этапу 1
-│       ├── 2.md                  # отчёт по этапу 2
-│       └── 3.md                  # отчёт по этапу 3
+│       ├── 1.md
+│       ├── 2.md
+│       └── 3.md
 ├── internal/
-│   ├── config/                   # парсинг конфига + env
-│   ├── identity/                 # Ed25519, NodeID
-│   ├── protocol/                 # кадр, типы, JSON-кодеки, бенчмарки
-│   ├── routing/                  # Contact, XOR, k-bucket, RoutingTable
-│   ├── transport/                # TCP, RPC-клиент
-│   ├── dht/                      # lookup.go, find_value.go
-│   ├── store/                    # record.go, store.go
-│   ├── node/                     # узел: сервер, PING/FIND_NODE/STORE/FIND_VALUE,
-│   │                             # bootstrap, observe, Lookup,
-│   │                             # Put/Get/PutAlias/GetAlias, republish
-│   ├── security/                 # резерв под этап 4
-│   ├── tunnel/                   # резерв под этап 5
-│   ├── application/              # резерв под этап 5
-│   ├── ui/                       # резерв
-│   └── experiments/              # резерв
+│   ├── config/
+│   ├── identity/
+│   ├── protocol/
+│   ├── routing/
+│   ├── transport/
+│   ├── dht/
+│   ├── store/
+│   ├── node/
+│   ├── security/          (резерв, этап 4)
+│   ├── tunnel/            (резерв, этап 5)
+│   ├── application/       (резерв, этап 5)
+│   ├── ui/                (резерв)
+│   └── experiments/       (резерв)
 ├── scripts/
-│   ├── demo.sh                   # запуск сети + lookup + seed failure
-│   ├── lookup.sh                 # серия контрольных lookup + CSV
-│   ├── bench.sh                  # сравнение форматов сериализации
-│   ├── check_non_degenerate.sh   # проверка невырожденности DHT
-│   └── store_experiment.sh       # STORE / FIND_VALUE + отказ хранителя
+│   ├── demo.sh
+│   ├── lookup.sh
+│   ├── bench.sh
+│   ├── check_non_degenerate.sh
+│   ├── bootstrap_schemes.sh
+│   ├── compare_bootstrap_schemes.sh
+│   └── store_experiment.sh
+├── results/
+│   ├── 1/
+│   │   ├── serialization-bench.txt
+│   │   └── serialization-sizes.txt
+│   ├── 2/
+│   │   ├── bootstrap-schemes/
+│   │   │   ├── bootstrap-comparison.txt
+│   │   │   ├── star/
+│   │   │   ├── ring/
+│   │   │   ├── tree/
+│   │   │   ├── multi-seed/
+│   │   │   ├── star-nondegeneracy.json
+│   │   │   ├── ring-nondegeneracy.json
+│   │   │   ├── tree-nondegeneracy.json
+│   │   │   └── multi-seed-nondegeneracy.json
+│   │   ├── star-lookups.csv
+│   │   ├── ring-lookups.csv
+│   │   ├── tree-lookups.csv
+│   │   └── multi-seed-lookups.csv
+│   └── 3/
+│       ├── star-store.csv
+│       ├── ring-store.csv
+│       ├── tree-store.csv
+│       ├── multi-seed-store.csv
+│       ├── star-store.txt
+│       ├── ring-store.txt
+│       ├── tree-store.txt
+│       └── multi-seed-store.txt
 ├── tests/
-│   ├── unit/                     # unit-тесты
-│   └── integration/              # интеграционные тесты
+│   ├── unit/
+│   │   ├── bucket_test.go
+│   │   ├── config_test.go
+│   │   ├── frame_test.go
+│   │   ├── identity_test.go
+│   │   ├── negative_test.go
+│   │   ├── pong_validation_test.go
+│   │   ├── protocol_test.go
+│   │   ├── routing_test.go
+│   │   ├── store_record_test.go
+│   │   └── store_test.go
+│   └── integration/
+│       ├── address_update_test.go
+│       ├── alias_test.go
+│       ├── dht_ops_test.go
+│       ├── e2e_test.go
+│       ├── lookup_stop_test.go
+│       ├── negative_sender_test.go
+│       ├── observe_async_test.go
+│       ├── observe_test.go
+│       ├── republish_test.go
+│       └── store_test.go
 ├── .gitignore
 ├── go.mod
 ├── go.sum
 └── README.md
 ```
 
-Артефакты запуска (`state-*/`, `results/`, логи) в `.gitignore`.
+Артефакты запуска (`state-*/`, `bin/`, `*.log`, `*.key`,
+`identity.pub`, `*.tmp`, `*.swp`) в `.gitignore`.
+Каталог `results/` **не исключается**: артефакты экспериментов
+хранятся в репозитории.
 
 ---
 
@@ -397,21 +512,31 @@ go test ./tests/unit/... -v
 Покрывают:
 
 - кадрирование: round-trip, поток 100 кадров со случайным разбиением,
-  завышенная длина, неверная версия;
-- сервер: выживание при ошибках (`TestServerSurvives*`);
-- идентичность: устойчивость `NodeID`, соответствие ключу;
+  завышенная длина, неверная версия, payload переменной длины
+  (`0`, `1`, `MaxFramePayload`, `MaxFramePayload+1`, 36 длин от `0`
+  до `MaxFramePayload`, 200 кадров с длинами `0..199`);
+- сервер: выживание при ошибках (`TestServerSurvives*`), partial header,
+  bad → good на одном соединении;
+- идентичность: устойчивость `NodeID`, соответствие ключу, сверка
+  `priv.Public()` с загруженным `pub`, отклонение рассинхронизированных
+  `identity.key`/`identity.pub`, падение `node.New`;
 - payload: round-trip всех типов, строгая валидация;
 - XOR-метрика и k-bucket: вставка, `Touch`, `LRU`, `ReplaceLRU`,
   `Remove`;
 - `RoutingTable`: полный bucket с живым LRU (`Promote`), полный bucket
   с мёртвым LRU (`ReplaceIfDead`), отклонение self-контакта,
-  `TouchVerified`;
-- `NodeRecord`: канонизация, подпись, `Validate` (включая TTL,
-  адреса, `sequence_number`, ненормализованный alias),
-  `NormalizeAlias`, `AliasKey`;
-- локальное хранилище: `Put`/`Get`, откат версии, TTL, персистентность.
+  `TouchVerified`, обновление адреса контакта (`TouchOrUpdate`,
+  `addressChanged`, `oldContact`);
+- `FromWire`: accept valid, bad DER, `NodeID` mismatch, mismatched
+  key+NodeID, short/long `NodeID`, bad algorithm, empty host, zero port;
+- `PONG`: валидация в `pingContact` (empty payload, zero responder,
+  mismatched responder, valid pong);
+- `NodeRecord`: канонизация, подпись, `Validate`;
+- локальное хранилище: `Put`/`Get`, откат версии, TTL, персистентность;
+- конфигурация: 17 подтестов `TestConfigValidateRejects` + 12
+  тестов `TestConfigLoad*` (включая ошибочные `SETI_*`).
 
-Итого **68 unit-тестов**.
+Итого **78 unit-тестов**.
 
 ### Integration-тесты
 
@@ -425,18 +550,31 @@ go test ./tests/integration/... -v
   через промежуточный узел;
 - `TestSeedFailureDoesNotBlockLookup` — пять узлов, отказ seed, lookup
   между двумя клиентами после отказа;
-- `TestStoreThenFindValue`, `TestFindValueMissReturnsContacts` —
-  `STORE`/`FIND_VALUE` на двух-трёх узлах;
-- `TestStoreRejectsRollbackOverNetwork`, `TestStorePersistsAcrossRestart`;
+- `TestLookupDistinguishesDiscoveredAndResponded`,
+  `TestLookupDoesNotQueryFailed`, `TestLookupStopsOnRespondedKClosest`,
+  `TestLookupSuccessWithDeadIntermediate` — разделение `discovered`/
+  `responded`/`failed`, условие остановки по `responded.closest(k)`;
+- `TestPingRejectsBadSenderContact`, `TestFindNodeRejectsBadSenderContact`,
+  `TestPingRejectsBadSenderAndClosesConn` — отклонение bad sender и
+  закрытие соединения после `ERROR`;
+- `TestPingDoesNotBlockOnLRUCheck`, `TestBackgroundLRUCheckLimited`,
+  `TestObservePromotesAliveLRUAsync`, `TestObserveReplacesDeadLRUAsync` —
+  асинхронная LRU-проверка и семафор `MaxBackgroundLRUChecks`;
+- `TestObservePromotesAliveLRU`, `TestObserveReplacesDeadLRU`,
+  `TestObserveTouchDoesNotPing`, `TestObserveAddToNonFullBucketDoesNotPing` —
+  синхронная LRU-логика на реальных `NodeID`;
+- `TestNodeObserveUpdatesAddressAfterPing`,
+  `TestNodeObserveKeepsOldAddressIfNewUnreachable` — обновление и
+  откат адреса контакта;
+- `TestStoreThenFindValue`, `TestFindValueMissReturnsContacts`,
+  `TestStoreRejectsRollbackOverNetwork`, `TestStorePersistsAcrossRestart`;
 - `TestPutThenGetAcrossNodes`, `TestGetAfterReplicaFailure`,
-  `TestPutLocalOnlyOnThreeNodes`, `TestPutReplicasCountsOwner` —
-  `Put`/`Get` на четырёх узлах, отказ хранителя, семантика `Replicas`;
+  `TestPutLocalOnlyOnThreeNodes`, `TestPutReplicasCountsOwner`;
 - `TestPutAliasThenGetByAlias`, `TestAliasLastWriterWins`,
-  `TestPutAliasRejects*`, `TestPutAliasRejectsInvalidRecord`,
-  `TestPutAliasRejectsInvalidAddress`, `TestGetAlias*` — псевдонимы;
-- `TestRepublishExtendsTTL` — переопубликование.
+  `TestPutAliasRejects*`, `TestGetAlias*`;
+- `TestRepublishExtendsTTL`.
 
-Итого **24 integration-теста**.
+Итого **38 integration-тестов**.
 
 ### Бенчмарки
 
@@ -462,7 +600,8 @@ go test ./... -count=1
 - **`docs/Node record.md`** — формат подписанной адресной записи,
   канонизация, подпись, TTL, псевдонимы, ограничения модели.
 - **`docs/Serialization comparison.md`** — сравнение JSON, MessagePack,
-  CBOR с числами по размеру, скорости и аллокациям.
+  CBOR с числами по размеру, скорости и аллокациям
+  (`results/1/serialization-*.txt`).
 - **`docs/sprints/1.md`**, **`docs/sprints/2.md`**,
   **`docs/sprints/3.md`** — отчёты по этапам с таблицами
   «требование → где реализовано».
@@ -471,14 +610,18 @@ go test ./... -count=1
 
 ## 12. Результаты этапов 1–2
 
-### Невырожденность DHT (`N=20, K=4`)
+### Невырожденность DHT (`N=20, K=4, ALPHA=3`)
 
-| Схема | `contacts < N-1` | full catalog | `buckets ≥ 2` | Вердикт |
-|---|---|---|---|---|
-| `star` | 20/20 | 0 | 16/20 | PASS |
-| `ring` | 20/20 | 0 | 17/20 | PASS |
-| `tree` | 20/20 | 0 | 16/20 | PASS |
-| `multi-seed` | 20/20 | 0 | 18/20 | PASS |
+| Схема | `contacts < N-1` | full catalog | `buckets ≥ 2` | avg contacts | avg non-empty buckets | Вердикт |
+|---|---|---|---|---|---|---|
+| `star` | 20/20 | 0 | 18/20 | 4.65 | 2.85 | PASS |
+| `ring` | 20/20 | 0 | 17/20 | 5.05 | 2.70 | PASS |
+| `tree` | 20/20 | 0 | 16/20 | 4.85 | 2.95 | PASS |
+| `multi-seed` | 20/20 | 0 | 18/20 | 5.05 | 2.85 | PASS |
+
+Артефакты: `results/2/bootstrap-schemes/bootstrap-comparison.txt`,
+`results/2/bootstrap-schemes/<scheme>/{configs,dumps,buckets.csv,summary.json}`,
+`results/2/bootstrap-schemes/<scheme>-nondegeneracy.json`.
 
 ### Серия lookup (30 запросов на схему)
 
@@ -491,6 +634,8 @@ go test ./... -count=1
 
 Все 120 lookup завершились успешно. Диапазон RPC (3–9) и итераций
 (1–3) соответствует Kademlia с `ALPHA=3`, `K=4`.
+Артефакты: `results/2/<scheme>-lookups.csv`,
+`results/2/<scheme>-lookups.txt`.
 
 ### Отказ seed
 
@@ -515,6 +660,9 @@ go test ./... -count=1
 хранителя и сколько из этих чтений были успешными. В summary
 печатается строка `victim_key=<short> reads=<N> success=<M>`.
 
+Артефакты: `results/3/<scheme>-store.csv`,
+`results/3/<scheme>-store.txt`.
+
 ### `TestRepublishExtendsTTL`
 
 `TTL = 4 с`, `republishInterval = 2 с`. Через 5 секунд после
@@ -527,7 +675,8 @@ go test ./... -count=1
 - `PutAlias` / `GetAlias` на четырёх узлах: `alice` → `ALICE` → `alice`.
 - `TestAliasLastWriterWins` подтверждает локальный last-writer-wins
   на стороне хранителя: `sequence_number` 1 → 2 вытесняет
-  предыдущую версию.
+  предыдущую версию. Тест использует `BuildSelfRecordWithSeq` для
+  детерминированного `SequenceNumber`.
 - `PutAlias` отклоняет чужую запись (`ErrAliasNotOwn`), запись
   с уже установленным `alias` (`ErrAliasAlreadySet`) и запись,
   не прошедшую `Validate` (`alias: invalid record: …`).
@@ -552,12 +701,19 @@ go test ./... -count=1
 - **Случайность `NodeID`.** Каждый прогон генерирует новые ключи,
   поэтому структура XOR-распределения меняется. Учтено: серии из
   50 наблюдений, выводы формулируются статистически.
+- **`TestBackgroundLRUCheckLimited`** использует «немой» TCP-listener
+  и синтетический контакт (`NodeID` от `b`, порт от listener'а),
+  чтобы `pingContact` не завершался мгновенно. Это тестовая
+  конструкция для проверки семафора `MaxBackgroundLRUChecks`, а не
+  сценарий рабочей сети. Остальные тесты E2-4 (`TestPingDoesNotBlockOnLRUCheck`,
+  `TestObservePromotesAliveLRUAsync`, `TestObserveReplacesDeadLRUAsync`)
+  используют реальные узлы.
 
 ---
 
 ## 15. Дальнейшие этапы
 
-- **Доработка 1-2 этапов.**
+- **Доработка этапа 3.**
 - **Этап 4.** TLS 1.3 с mutual auth (упрощённый) или собственный AKE
   на Ed25519/X25519/HKDF/AEAD (продвинутый).
 - **Этап 5.** Туннельная ретрансляция (`TUNNEL_BUILD`, `TUNNEL_DATA`,

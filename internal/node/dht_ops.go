@@ -140,7 +140,7 @@ func (n *Node) Get(ctx context.Context, key []byte) (*store.NodeRecord, bool, er
 	res := fv.Run(ctx, key)
 
 	for _, c := range res.Discovered {
-		n.observe(c)
+		n.observeAsync(c)
 	}
 
 	if res.Success && res.Record != nil {

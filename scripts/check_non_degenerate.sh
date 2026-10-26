@@ -9,7 +9,7 @@ SCHEME=${SCHEME:-star}
 NODES=${NODES:-20}
 STATE=state-${SCHEME}
 DUMPS=$STATE/dump
-RESULTS_DIR=${RESULTS_DIR:-results}
+RESULTS_DIR=${RESULTS_DIR:-results/2}
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required" >&2
@@ -19,7 +19,7 @@ fi
 OUT="$RESULTS_DIR/${SCHEME}-nondegeneracy.json"
 mkdir -p "$RESULTS_DIR"
 
-echo "==> checking non-degeneracy for scheme=${SCHEME} N=${NODES}"
+echo "checking non-degeneracy for scheme=${SCHEME} N=${NODES}"
 
 mapfile -t dumps < <(ls "$DUMPS"/routing-*-initial.json 2>/dev/null || true)
 
@@ -29,13 +29,13 @@ if [ "${#dumps[@]}" -lt 2 ]; then
 fi
 
 total_nodes=${#dumps[@]}
-echo "  found ${total_nodes} initial dumps (expected ${NODES})"
+echo "found ${total_nodes} initial dumps (expected ${NODES})"
 
 if [ "$total_nodes" -ne "$NODES" ]; then
-  echo "  ERROR: expected ${NODES} dumps, got ${total_nodes}" >&2
-  echo "  some nodes failed to produce initial dumps; cannot reliably" >&2
-  echo "  assess non-degeneracy. Check readiness markers and increase" >&2
-  echo "  DUMP_TIMEOUT if needed." >&2
+  echo "ERROR: expected ${NODES} dumps, got ${total_nodes}" >&2
+  echo "some nodes failed to produce initial dumps; cannot reliably" >&2
+  echo "assess non-degeneracy. Check readiness markers and increase" >&2
+  echo "DUMP_TIMEOUT if needed." >&2
   exit 2
 fi
 
@@ -51,7 +51,7 @@ for f in "${dumps[@]}"; do
   fi
 done
 
-echo "  nodes with contacts < N-1: ${le_count}/${total_nodes} (threshold ${threshold})"
+echo "nodes with contacts < N-1: ${le_count}/${total_nodes} (threshold ${threshold})"
 
 full_catalog=0
 for c in "${contacts_arr[@]}"; do
@@ -59,7 +59,7 @@ for c in "${contacts_arr[@]}"; do
     full_catalog=$((full_catalog + 1))
   fi
 done
-echo "  nodes with full catalog (contacts >= N-1): ${full_catalog}"
+echo "nodes with full catalog (contacts >= N-1): ${full_catalog}"
 
 structured=0
 for f in "${dumps[@]}"; do
@@ -68,19 +68,19 @@ for f in "${dumps[@]}"; do
     structured=$((structured + 1))
   fi
 done
-echo "  nodes with >=2 non-empty buckets: ${structured}/${total_nodes}"
+echo "nodes with >=2 non-empty buckets: ${structured}/${total_nodes}"
 
 pass=1
 if [ "$le_count" -lt "$threshold" ]; then
-  echo "  FAIL: less than 80% nodes have contacts < N-1" >&2
+  echo "FAIL: less than 80% nodes have contacts < N-1" >&2
   pass=0
 fi
 if [ "$full_catalog" -gt 0 ]; then
-  echo "  FAIL: some nodes have full catalog" >&2
+  echo "FAIL: some nodes have full catalog" >&2
   pass=0
 fi
 if [ "$structured" -lt "$threshold" ]; then
-  echo "  FAIL: less than 80% nodes have structured buckets" >&2
+  echo "FAIL: less than 80% nodes have structured buckets" >&2
   pass=0
 fi
 
@@ -103,9 +103,9 @@ jq -n \
   }' | tee "$OUT"
 
 if [ "$pass" -eq 1 ]; then
-  echo "==> PASS: DHT is non-degenerate"
+  echo "PASS: DHT is non-degenerate"
   exit 0
 else
-  echo "==> FAIL: DHT is degenerate" >&2
+  echo "FAIL: DHT is degenerate" >&2
   exit 1
 fi

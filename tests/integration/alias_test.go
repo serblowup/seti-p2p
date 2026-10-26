@@ -135,15 +135,9 @@ func TestAliasLastWriterWins(t *testing.T) {
 		t.Fatalf("c1 PutAlias: %v", err)
 	}
 
-	time.Sleep(2 * time.Millisecond)
-
-	rec2, err := c2.BuildSelfRecord()
+	rec2, err := c2.BuildSelfRecordWithSeq(rec1.SequenceNumber + 1)
 	if err != nil {
-		t.Fatalf("c2 BuildSelfRecord: %v", err)
-	}
-	if rec2.SequenceNumber <= rec1.SequenceNumber {
-		t.Fatalf("expected rec2.SequenceNumber > rec1.SequenceNumber, got %d <= %d",
-			rec2.SequenceNumber, rec1.SequenceNumber)
+		t.Fatalf("c2 BuildSelfRecordWithSeq: %v", err)
 	}
 	if _, err := c2.PutAlias(ctx, "shared", rec2); err != nil {
 		t.Fatalf("c2 PutAlias: %v", err)

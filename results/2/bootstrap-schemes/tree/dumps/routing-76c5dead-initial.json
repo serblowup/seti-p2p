@@ -1,0 +1,30 @@
+{
+  "node_id": "76c5dead99db5531a1621ee3911b9e604b73c680b1a5cee3a0105fe347cf5ea3",
+  "k_bucket_size": 4,
+  "total_contacts": 2,
+  "buckets": [
+    {
+      "index": 0,
+      "contacts": [
+        {
+          "node_id": "ad945d5231808caecc7a6280bcee2242b9882d593684ff68ef342923462c7c91",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100336ce82fb40b20ed7440863c900fd2f74602895bd9b3e3f515ae519221dbf2a6",
+          "host": "127.0.0.1",
+          "port": 9101,
+          "last_seen_ms": 1793035848334,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "98d66f29342e693da4046b9f73a0d1d4c9d4f960f557a6f043eeba49d7805f9a",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b65700321002673267c2a50547dc0734048ac3145ff69760ee4507000f6e1810bc21b324095",
+          "host": "127.0.0.1",
+          "port": 9102,
+          "last_seen_ms": 1793035848335,
+          "last_verified_ms": 0
+        }
+      ]
+    }
+  ]
+}

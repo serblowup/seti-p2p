@@ -1,0 +1,9 @@
+Сравнение bootstrap-схем
+Источник: results/2/bootstrap-schemes/<scheme>/summary.json
+Воспроизведение: ./scripts/bootstrap_schemes.sh && ./scripts/compare_bootstrap_schemes.sh
+
+scheme      N   K  ALPHA  avg_contacts  avg_nonempty_buckets  nondegeneracy_pass
+star        20  4  3      4.65          2.85                  true
+ring        20  4  3      5.05          2.70                  true
+tree        20  4  3      4.85          2.95                  true
+multi-seed  20  4  3      5.05          2.85                  true

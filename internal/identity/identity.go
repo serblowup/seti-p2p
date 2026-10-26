@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -29,8 +30,20 @@ func LoadOrCreate(stateDir string) (*Identity, error) {
 	privPath := filepath.Join(stateDir, PrivFile)
 	pubPath := filepath.Join(stateDir, PubFile)
 
-	if _, err := os.Stat(privPath); err == nil {
+	_, privErr := os.Stat(privPath)
+	_, pubErr := os.Stat(pubPath)
+
+	switch {
+	case privErr == nil && pubErr == nil:
 		return load(privPath, pubPath)
+	case privErr == nil && pubErr != nil:
+		return nil, fmt.Errorf("identity: %s exists but %s missing", PrivFile, PubFile)
+	case privErr != nil && pubErr == nil:
+		return nil, fmt.Errorf("identity: %s exists but %s missing", PubFile, PrivFile)
+	case !os.IsNotExist(privErr):
+		return nil, privErr
+	case !os.IsNotExist(pubErr):
+		return nil, pubErr
 	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -67,32 +80,39 @@ func load(privPath, pubPath string) (*Identity, error) {
 	}
 	blk, _ := pem.Decode(privPem)
 	if blk == nil {
-		return nil, errors.New("bad private key PEM")
+		return nil, errors.New("identity: bad private key PEM")
 	}
 	keyAny, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("identity: parse private key: %w", err)
 	}
 	priv, ok := keyAny.(ed25519.PrivateKey)
 	if !ok {
-		return nil, errors.New("not an ed25519 private key")
+		return nil, errors.New("identity: not an ed25519 private key")
 	}
+
 	pubPem, err := os.ReadFile(pubPath)
 	if err != nil {
 		return nil, err
 	}
 	pubBlk, _ := pem.Decode(pubPem)
 	if pubBlk == nil {
-		return nil, errors.New("bad public key PEM")
+		return nil, errors.New("identity: bad public key PEM")
 	}
 	pubAny, err := x509.ParsePKIXPublicKey(pubBlk.Bytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("identity: parse public key: %w", err)
 	}
 	pub, ok := pubAny.(ed25519.PublicKey)
 	if !ok {
-		return nil, errors.New("not an ed25519 public key")
+		return nil, errors.New("identity: not an ed25519 public key")
 	}
+
+	derived := priv.Public().(ed25519.PublicKey)
+	if !bytes.Equal(derived, pub) {
+		return nil, errors.New("identity: public key does not match private key")
+	}
+
 	return &Identity{Priv: priv, Pub: pub}, nil
 }
 

@@ -37,6 +37,23 @@ func (b *Bucket) Touch(nodeID []byte) bool {
 	return true
 }
 
+func (b *Bucket) TouchOrUpdate(c Contact) (updated bool, old Contact, found bool) {
+	i := b.IndexOf(c.NodeID)
+	if i < 0 {
+		return false, Contact{}, false
+	}
+	old = b.contacts[i]
+	updated = old.Host != c.Host || old.Port != c.Port
+	if updated {
+		b.contacts[i].Host = c.Host
+		b.contacts[i].Port = c.Port
+	}
+	existing := b.contacts[i]
+	b.contacts = append(b.contacts[:i], b.contacts[i+1:]...)
+	b.contacts = append(b.contacts, existing)
+	return updated, old, true
+}
+
 func (b *Bucket) LRU() (Contact, bool) {
 	if len(b.contacts) == 0 {
 		return Contact{}, false

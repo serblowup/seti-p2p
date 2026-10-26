@@ -14,6 +14,7 @@ type RPCClient struct {
 	MaxPayload   int
 	ConnectTO    time.Duration
 	ReadTO       time.Duration
+	WriteTO      time.Duration
 }
 
 func (c *RPCClient) Call(ctx context.Context, peer routing.Contact, req *protocol.Frame, expectedResponseType uint8) (*protocol.Frame, error) {
@@ -23,7 +24,7 @@ func (c *RPCClient) Call(ctx context.Context, peer routing.Contact, req *protoco
 	}
 	defer conn.Close()
 
-	if err := WriteFrame(conn, req); err != nil {
+	if err := WriteFrameWithDeadline(conn, req, c.WriteTO); err != nil {
 		return nil, err
 	}
 

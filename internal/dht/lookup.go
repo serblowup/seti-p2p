@@ -20,6 +20,7 @@ type LookupResult struct {
 	RPCs       int               `json:"rpcs"`
 	Iterations int               `json:"iterations"`
 	Timeouts   int               `json:"timeouts"`
+	Responded  int               `json:"responded"`
 	DurationMs int64             `json:"duration_ms"`
 	Trace      []IterationTrace  `json:"trace"`
 
@@ -30,6 +31,7 @@ type IterationTrace struct {
 	Iteration  int      `json:"iteration"`
 	Queried    [][]byte `json:"queried"`
 	Discovered [][]byte `json:"discovered"`
+	Responded  [][]byte `json:"responded"`
 }
 
 type Lookup struct {
@@ -90,6 +92,9 @@ func (l *Lookup) Run(ctx context.Context, target []byte) LookupResult {
 				failed[key(r.peer.NodeID)] = true
 				continue
 			}
+			all.markResponded(r.peer)
+			trace.Responded = append(trace.Responded, r.peer.NodeID)
+			res.Responded++
 			for _, c := range r.resp {
 				if bytesEqual(c.NodeID, l.LocalID) {
 					continue
@@ -102,14 +107,14 @@ func (l *Lookup) Run(ctx context.Context, target []byte) LookupResult {
 		}
 		res.Trace = append(res.Trace, trace)
 
-		kClosest := all.closest(target, l.Cfg.KBucketSize)
-		if !all.hasUnqueriedCloserThan(target, queried, failed, kClosest) {
+		respondedClosest := all.respondedClosest(target, l.Cfg.KBucketSize)
+		if !all.hasUnqueriedCloserThan(target, queried, failed, respondedClosest) {
 			break
 		}
 	}
 
 	res.Iterations = iteration
-	res.Closest = all.closest(target, l.Cfg.KBucketSize)
+	res.Closest = all.respondedClosest(target, l.Cfg.KBucketSize)
 	for _, c := range res.Closest {
 		if bytesEqual(c.NodeID, target) {
 			res.Success = true
@@ -158,11 +163,15 @@ func (l *Lookup) findNodeOnce(ctx context.Context, peer routing.Contact, target 
 }
 
 type candidateSet struct {
-	byID map[string]routing.Contact
+	byID      map[string]routing.Contact
+	responded map[string]routing.Contact
 }
 
 func newCandidateSet(cs []routing.Contact) *candidateSet {
-	s := &candidateSet{byID: map[string]routing.Contact{}}
+	s := &candidateSet{
+		byID:      map[string]routing.Contact{},
+		responded: map[string]routing.Contact{},
+	}
 	for _, c := range cs {
 		s.add(c)
 	}
@@ -178,9 +187,28 @@ func (s *candidateSet) add(c routing.Contact) bool {
 	return true
 }
 
+func (s *candidateSet) markResponded(c routing.Contact) {
+	s.responded[key(c.NodeID)] = c
+}
+
 func (s *candidateSet) closest(target []byte, n int) []routing.Contact {
 	out := make([]routing.Contact, 0, len(s.byID))
 	for _, c := range s.byID {
+		out = append(out, c)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return routing.XorDistance(out[i].NodeID, target).Cmp(
+			routing.XorDistance(out[j].NodeID, target)) < 0
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+func (s *candidateSet) respondedClosest(target []byte, n int) []routing.Contact {
+	out := make([]routing.Contact, 0, len(s.responded))
+	for _, c := range s.responded {
 		out = append(out, c)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -211,11 +239,16 @@ func (s *candidateSet) unqueried(target []byte, queried, failed map[string]bool,
 	return all
 }
 
-func (s *candidateSet) hasUnqueriedCloserThan(target []byte, queried, failed map[string]bool, kClosest []routing.Contact) bool {
-	if len(kClosest) == 0 {
+func (s *candidateSet) hasUnqueriedCloserThan(target []byte, queried, failed map[string]bool, respondedClosest []routing.Contact) bool {
+	if len(respondedClosest) == 0 {
+		for k := range s.byID {
+			if !queried[k] && !failed[k] {
+				return true
+			}
+		}
 		return false
 	}
-	worst := routing.XorDistance(kClosest[len(kClosest)-1].NodeID, target)
+	worst := routing.XorDistance(respondedClosest[len(respondedClosest)-1].NodeID, target)
 	for k, c := range s.byID {
 		if queried[k] || failed[k] {
 			continue

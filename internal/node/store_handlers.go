@@ -19,7 +19,7 @@ func (n *Node) handleStore(f *protocol.Frame) (*protocol.Frame, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad sender contact: %w", err)
 	}
-	n.observe(sender)
+	n.observeAsync(sender)
 
 	putErr := n.store.Put(&req.Record)
 	resp := protocol.StoreResponsePayload{Stored: putErr == nil}
@@ -51,7 +51,7 @@ func (n *Node) handleFindValue(f *protocol.Frame) (*protocol.Frame, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad sender contact: %w", err)
 	}
-	n.observe(sender)
+	n.observeAsync(sender)
 
 	self, err := n.SelfContact()
 	if err != nil {

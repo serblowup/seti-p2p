@@ -1,7 +1,7 @@
 # Сравнение форматов сериализации payload
 
 **Документ:** обоснование выбора JSON для payload протокола на этапах 1–2.
-**Источник данных:** `results/serialization-sizes.txt`, `results/serialization-bench.txt`.
+**Источник данных:** `results/1/serialization-sizes.txt`, `results/1/serialization-bench.txt`.
 **Воспроизведение:** `./scripts/bench.sh`.
 **Окружение замера:** AMD Ryzen 5 7535HS, linux/amd64, Go 1.27.
 
@@ -41,7 +41,11 @@ MessagePack, CBOR, Protocol Buffers либо эквивалентный форм
 
 Основной протокол использует **JSON** через `internal/protocol/messages.go`:
 `EncodePayload` / `DecodePing` / `DecodePong` / `DecodeFindNodeRequest` /
-`DecodeFindNodeResponse` / `DecodeError`.
+`DecodeFindNodeResponse` / `DecodeStoreRequest` / `DecodeStoreResponse` /
+`DecodeFindValueRequest` / `DecodeFindValueResponse` / `DecodeError`.
+Все декодеры используют `decodeStrict` (`DisallowUnknownFields` +
+`dec.More()`), поэтому бенчмарк меряет **именно тот путь**, который
+работает в протоколе.
 
 Альтернативные кодеки — `internal/protocol/altcodecs.go`:
 `EncodeMsgpack` / `DecodeMsgpack` / `EncodeCBOR` / `DecodeCBOR`.
@@ -49,7 +53,7 @@ MessagePack, CBOR, Protocol Buffers либо эквивалентный форм
 протоколе.
 
 Замеры воспроизводятся скриптом `scripts/bench.sh` и сохраняются в
-`results/serialization-sizes.txt` и `results/serialization-bench.txt`.
+`results/1/serialization-sizes.txt` и `results/1/serialization-bench.txt`.
 
 ---
 
@@ -80,36 +84,46 @@ payload за счёт отсутствия строковых ключей, ка
 
 | Операция | JSON, ns/op | MessagePack, ns/op | CBOR, ns/op |
 |---|---:|---:|---:|
-| Encode PING | 653 | 548 | **297** |
-| Encode FIND_NODE_RESPONSE | 1719 | 1596 | **858** |
+| Encode PING | 658 | 561 | **303** |
+| Encode FIND_NODE_RESPONSE | 1755 | 1618 | **895** |
 
-**CBOR выигрывает у JSON и msgpack по encode в 1.8–2.1 раза.** Это
+**CBOR выигрывает у JSON и msgpack по encode в 1.8–2.2 раза.** Это
 следствие прямого кодирования в буфер без промежуточных
 `map[string]interface{}`, которыми пользуется `encoding/json`.
 
 Относительно JSON:
 
-- msgpack быстрее по encode PING в **1.19 раза**, по FNR — в **1.08 раза**;
-- CBOR быстрее по encode PING в **2.20 раза**, по FNR — в **2.00 раза**.
+- msgpack быстрее по encode PING в **1.17 раза**, по FNR — в **1.08 раза**;
+- CBOR быстрее по encode PING в **2.17 раза**, по FNR — в **1.96 раза**.
 
 ---
 
 ## 6. Скорость decode
 
+**Важно:** бенчмарк меряет **реальный путь протокола** — `DecodePing` /
+`DecodeFindNodeResponse` с `decodeStrict` (`DisallowUnknownFields` +
+`dec.More()`), а не прямой `json.Unmarshal`. Это тот же декодер, что
+работает в `handleConn`.
+
 | Операция | JSON, ns/op | MessagePack, ns/op | CBOR, ns/op |
 |---|---:|---:|---:|
-| Decode PING | 1060 | **635** | 765 |
-| Decode FIND_NODE_RESPONSE | 3737 | **2325** | 2722 |
+| Decode PING | 2019 | **625** | 755 |
+| Decode FIND_NODE_RESPONSE | 6009 | **2291** | 2619 |
 
-**MessagePack быстрее по decode** — в 1.4–1.7 раза относительно JSON и
-в 1.2 раза относительно CBOR. Это объясняется оптимизированным
-декодером `vmihailenco/msgpack/v5`, который читает бинарные поля
-напрямую без разбора текстовых токенов.
+**MessagePack быстрее по decode** — в 3.2 раза относительно JSON на PING
+и в 2.6 раза на FNR. Относительно CBOR — в 1.2 раза. Это объясняется
+оптимизированным декодером `vmihailenco/msgpack/v5`, который читает
+бинарные поля напрямую без разбора текстовых токенов.
 
 Относительно JSON:
 
-- msgpack быстрее по decode PING в **1.67 раза**, по FNR — в **1.61 раза**;
-- CBOR быстрее по decode PING в **1.39 раза**, по FNR — в **1.37 раза**.
+- msgpack быстрее по decode PING в **3.23 раза**, по FNR — в **2.62 раза**;
+- CBOR быстрее по decode PING в **2.67 раза**, по FNR — в **2.29 раза**.
+
+Разница с encode существенная: строгая валидация JSON через
+`json.Decoder` с `DisallowUnknownFields` и `dec.More()` заметно дороже
+прямого `json.Unmarshal`. На этапах 1–2 это осознанный выбор в пользу
+строгости, а не скорости.
 
 ---
 
@@ -118,15 +132,14 @@ payload за счёт отсутствия строковых ключей, ка
 | Операция | JSON (B/op, allocs) | MessagePack (B/op, allocs) | CBOR (B/op, allocs) |
 |---|---|---|---|
 | Encode PING | 448, 3 | 592, 5 | **288, 2** |
-| Decode PING | 176, 3 | 240, 6 | **192, 5** |
+| Decode PING | 1161, 11 | 240, 6 | 192, 5 |
 | Encode FNR | 1312, 3 | 2177, 7 | **912, 2** |
-| Decode FNR | 1120, 13 | 1256, 24 | **872, 20** |
+| Decode FNR | 3644, 23 | 1256, 24 | 872, 20 |
 
-**CBOR аллоцирует меньше всего байт** (288 B и 912 B на encode).
-При decode msgpack аллоцирует меньше байт, но делает больше вызовов
-аллокатора (24 против 20 у CBOR). JSON по числу аллокаций формально
-самый экономичный на PING (3 allocs), но с ростом размера payload
-этот эффект пропадает: на FNR у JSON 13 allocs против 20 у CBOR.
+**CBOR аллоцирует меньше всего байт** на encode (288 B и 912 B).
+При decode msgpack и CBOR аллоцируют в 5–6 раз меньше байт, чем JSON:
+`decodeStrict` создаёт `bytes.Reader`, `json.Decoder` и промежуточные
+структуры, что видно по 11–23 аллокациям против 5–24 у альтернатив.
 
 Интересно, что msgpack при encode тратит **больше памяти, чем JSON**
 (592 B против 448 B на PING): его энкодер использует внутренний буфер
@@ -184,10 +197,12 @@ JSON выигрывает по удобству отладки: payload можн
    `encoding/json` из stdlib. Это упрощает сборку и ревью.
 4. **Экономия msgpack/CBOR на этом масштабе несущественна** для практики.
    Все payload малы (< 1 КБ). Узкое место — RPC-задержки и TCP-хендшейки,
-   а не время encode/decode: медиана длительности lookup на loopback у нас
-   составляет **1.00 мс**, а один encode PING — **0.65 мкс**, то есть
-   **0.065 %** от времени операции. Даже двукратная разница в скорости
-   кодирования на таком масштабе не наблюдаема.
+   а не время encode/decode. Медиана длительности lookup на loopback
+   у нас составляет **1.00 мс**, а один `DecodePing` — **2.0 мкс**, то есть
+   **0.2 %** от времени операции. Даже трёхкратная разница в скорости
+   декодирования на таком масштабе не наблюдаема в end-to-end метриках.
+   При этом encode PING (0.66 мкс) — **0.066 %**, а decode FNR (6.0 мкс)
+   при `k = 3` — доли процента от lookup.
 
 **MessagePack или CBOR** становятся осмысленным выбором при переходе
 к этапу 3 и далее, когда появятся:
@@ -197,9 +212,10 @@ JSON выигрывает по удобству отладки: payload можн
 - передача файлов блоками по 48–60 КиБ.
 
 На этих объёмах 23–25 % экономии превращаются в реальные килобайты на
-кадр, а CBOR по encode и аллокациям показывает лучший результат.
-Решение принимается отдельно на этапе 3 по результатам экспериментов
-и потребует bump версии протокола (`PROTOCOL_VERSION`).
+кадр, а CBOR по encode и аллокациям, а msgpack по decode показывают
+лучший результат. Решение принимается отдельно на этапе 3 по
+результатам экспериментов и потребует bump версии протокола
+(`PROTOCOL_VERSION`).
 
 Кодек изолирован в `internal/protocol/`: замена формата не затронет
 транспорт, узел и DHT. Это оставляет пространство для смены формата
@@ -211,8 +227,8 @@ JSON выигрывает по удобству отладки: payload можн
 
 ```bash
 ./scripts/bench.sh
-cat results/serialization-sizes.txt
-cat results/serialization-bench.txt
+cat results/1/serialization-sizes.txt
+cat results/1/serialization-bench.txt
 ```
 
 Скрипт `scripts/bench.sh` выполняет:
@@ -220,7 +236,7 @@ cat results/serialization-bench.txt
 1. `go test ./internal/protocol/ -run TestSerializationSizes -v` — размеры;
 2. `go test ./internal/protocol/ -bench 'BenchmarkPing|BenchmarkFindNode' -benchmem -run '^$' -count=3` — скорости и аллокации.
 
-Артефакты сохраняются в `results/`:
+Артефакты сохраняются в `results/1/`:
 
-- `results/serialization-sizes.txt` — размеры payload;
-- `results/serialization-bench.txt` — бенчмарки с тремя прогонами.
+- `results/1/serialization-sizes.txt` — размеры payload;
+- `results/1/serialization-bench.txt` — бенчмарки с тремя прогонами.

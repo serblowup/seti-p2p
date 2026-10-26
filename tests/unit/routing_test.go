@@ -2,8 +2,13 @@ package unit
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"testing"
 
+	"seti-p2p/internal/identity"
+	"seti-p2p/internal/protocol"
 	"seti-p2p/internal/routing"
 )
 
@@ -42,17 +47,17 @@ func TestRoutingTableFullBucketAliveLRU(t *testing.T) {
 	c2 := mkContactRT(0x81, "127.0.0.1", 9102)
 	fresh := mkContactRT(0x82, "127.0.0.1", 9103)
 
-	if _, _, err := rt.Observe(c1); err != nil {
+	if _, _, _, _, err := rt.Observe(c1); err != nil {
 		t.Fatalf("Observe(c1): %v", err)
 	}
-	if _, _, err := rt.Observe(c2); err != nil {
+	if _, _, _, _, err := rt.Observe(c2); err != nil {
 		t.Fatalf("Observe(c2): %v", err)
 	}
 	if rt.TotalContacts() != 2 {
 		t.Fatalf("expected 2 contacts, got %d", rt.TotalContacts())
 	}
 
-	checkLRU, lru, err := rt.Observe(fresh)
+	checkLRU, lru, _, _, err := rt.Observe(fresh)
 	if err != nil {
 		t.Fatalf("Observe(fresh): %v", err)
 	}
@@ -100,14 +105,14 @@ func TestRoutingTableFullBucketDeadLRU(t *testing.T) {
 	c2 := mkContactRT(0x81, "127.0.0.1", 9102)
 	fresh := mkContactRT(0x82, "127.0.0.1", 9103)
 
-	if _, _, err := rt.Observe(c1); err != nil {
+	if _, _, _, _, err := rt.Observe(c1); err != nil {
 		t.Fatalf("Observe(c1): %v", err)
 	}
-	if _, _, err := rt.Observe(c2); err != nil {
+	if _, _, _, _, err := rt.Observe(c2); err != nil {
 		t.Fatalf("Observe(c2): %v", err)
 	}
 
-	checkLRU, lru, err := rt.Observe(fresh)
+	checkLRU, lru, _, _, err := rt.Observe(fresh)
 	if err != nil {
 		t.Fatalf("Observe(fresh): %v", err)
 	}
@@ -153,7 +158,7 @@ func TestRoutingTableSelfContactRejected(t *testing.T) {
 	rt := routing.NewRoutingTable(localID, 4)
 
 	self := mkContactRT(0x42, "127.0.0.1", 9101)
-	_, _, err := rt.Observe(self)
+	_, _, _, _, err := rt.Observe(self)
 	if err == nil {
 		t.Fatal("expected error for self contact")
 	}
@@ -169,10 +174,10 @@ func TestRoutingTableTouchVerified(t *testing.T) {
 	c1 := mkContactRT(0x80, "127.0.0.1", 9101)
 	c2 := mkContactRT(0x81, "127.0.0.1", 9102)
 
-	if _, _, err := rt.Observe(c1); err != nil {
+	if _, _, _, _, err := rt.Observe(c1); err != nil {
 		t.Fatalf("Observe(c1): %v", err)
 	}
-	if _, _, err := rt.Observe(c2); err != nil {
+	if _, _, _, _, err := rt.Observe(c2); err != nil {
 		t.Fatalf("Observe(c2): %v", err)
 	}
 
@@ -191,5 +196,210 @@ func TestRoutingTableTouchVerified(t *testing.T) {
 	}
 	if contacts[1].LastVerifiedMs != 12345 {
 		t.Fatalf("expected LastVerifiedMs=12345, got %d", contacts[1].LastVerifiedMs)
+	}
+}
+
+func mkValidContactWire(t *testing.T) (protocol.ContactWire, ed25519.PublicKey) {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nid, err := identity.NodeIDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.ContactWire{
+		NodeID:            nid,
+		IdentityAlgorithm: "ed25519",
+		IdentityPublicKey: der,
+		Host:              "127.0.0.1",
+		Port:              9100,
+	}, pub
+}
+
+func TestFromWireAcceptsValid(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	c, err := routing.FromWire(w)
+	if err != nil {
+		t.Fatalf("FromWire: %v", err)
+	}
+	if !bytes.Equal(c.NodeID, w.NodeID) {
+		t.Fatal("NodeID mismatch")
+	}
+	if c.Host != w.Host || c.Port != w.Port {
+		t.Fatal("address mismatch")
+	}
+}
+
+func TestFromWireRejectsBadDER(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.IdentityPublicKey = []byte{0xde, 0xad, 0xbe, 0xef}
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for invalid DER SPKI")
+	}
+}
+
+func TestFromWireRejectsNodeIDMismatch(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	_, otherPub := mkValidContactWire(t)
+	otherNID, err := identity.NodeIDFromPublicKey(otherPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.NodeID = otherNID
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for node_id / key mismatch")
+	}
+}
+
+func TestFromWireRejectsMismatchedKeyAndNodeID(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	_, otherPub := mkValidContactWire(t)
+	otherDER, err := x509.MarshalPKIXPublicKey(otherPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.IdentityPublicKey = otherDER
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for mismatched IdentityPublicKey and NodeID")
+	}
+}
+
+func TestFromWireRejectsShortNodeID(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.NodeID = w.NodeID[:31]
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for short node_id")
+	}
+}
+
+func TestFromWireRejectsLongNodeID(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.NodeID = append(w.NodeID, 0x00)
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for long node_id")
+	}
+}
+
+func TestFromWireRejectsBadAlgorithm(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.IdentityAlgorithm = "rsa"
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for unsupported algorithm")
+	}
+}
+
+func TestFromWireRejectsEmptyHost(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.Host = ""
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for empty host")
+	}
+}
+
+func TestFromWireRejectsZeroPort(t *testing.T) {
+	w, _ := mkValidContactWire(t)
+	w.Port = 0
+	if _, err := routing.FromWire(w); err == nil {
+		t.Fatal("expected error for zero port")
+	}
+}
+
+func mkContactWithAddr(t *testing.T, id byte, host string, port uint16) routing.Contact {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nid, err := identity.NodeIDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 0 {
+		nid[0] = id
+	}
+	return routing.Contact{
+		NodeID:            nid,
+		IdentityAlgorithm: "ed25519",
+		IdentityPublicKey: der,
+		Host:              host,
+		Port:              port,
+	}
+}
+
+func TestObserveUpdatesContactAddress(t *testing.T) {
+	localID := make([]byte, 32)
+	rt := routing.NewRoutingTable(localID, 4)
+
+	c := mkContactWithAddr(t, 0x80, "127.0.0.1", 9101)
+	if _, _, _, _, err := rt.Observe(c); err != nil {
+		t.Fatalf("Observe first: %v", err)
+	}
+
+	updated := c
+	updated.Host = "127.0.0.2"
+	updated.Port = 9202
+
+	checkLRU, _, addressChanged, oldContact, err := rt.Observe(updated)
+	if err != nil {
+		t.Fatalf("Observe updated: %v", err)
+	}
+	if checkLRU {
+		t.Fatal("checkLRU must be false when contact address updates")
+	}
+	if !addressChanged {
+		t.Fatal("addressChanged must be true")
+	}
+	if oldContact.Host != "127.0.0.1" || oldContact.Port != 9101 {
+		t.Fatalf("oldContact=%s:%d, want 127.0.0.1:9101", oldContact.Host, oldContact.Port)
+	}
+
+	nearest := rt.Nearest(c.NodeID, 10)
+	if len(nearest) != 1 {
+		t.Fatalf("TableSize=%d, want 1", len(nearest))
+	}
+	if nearest[0].Host != "127.0.0.2" || nearest[0].Port != 9202 {
+		t.Fatalf("table still has old address %s:%d", nearest[0].Host, nearest[0].Port)
+	}
+}
+
+func TestObserveKeepsOldAddressIfNewUnreachable(t *testing.T) {
+	localID := make([]byte, 32)
+	rt := routing.NewRoutingTable(localID, 4)
+
+	c := mkContactWithAddr(t, 0x80, "127.0.0.1", 9101)
+	if _, _, _, _, err := rt.Observe(c); err != nil {
+		t.Fatalf("Observe first: %v", err)
+	}
+
+	updated := c
+	updated.Host = "127.0.0.2"
+	updated.Port = 9202
+
+	_, _, addressChanged, oldContact, err := rt.Observe(updated)
+	if err != nil {
+		t.Fatalf("Observe updated: %v", err)
+	}
+	if !addressChanged {
+		t.Fatal("addressChanged must be true")
+	}
+
+	rt.ReplaceIfDead(c.NodeID, oldContact)
+
+	nearest := rt.Nearest(c.NodeID, 10)
+	if len(nearest) != 1 {
+		t.Fatalf("TableSize=%d, want 1", len(nearest))
+	}
+	if nearest[0].Host != "127.0.0.1" || nearest[0].Port != 9101 {
+		t.Fatalf("table has new unreachable address %s:%d", nearest[0].Host, nearest[0].Port)
 	}
 }

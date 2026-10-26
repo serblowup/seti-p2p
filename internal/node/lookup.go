@@ -24,7 +24,7 @@ func (n *Node) Lookup(ctx context.Context, target []byte) (dht.LookupResult, err
 	res := l.Run(ctx, target)
 
 	for _, c := range res.Discovered {
-		n.observe(c)
+		n.observeAsync(c)
 	}
 	return res, nil
 }

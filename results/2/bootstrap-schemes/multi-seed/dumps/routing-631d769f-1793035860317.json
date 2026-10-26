@@ -1,0 +1,108 @@
+{
+  "node_id": "631d769f72ebe0adf28b2643b1a6d04ccd70cddb7a5633f2e03f158e3ca191a0",
+  "k_bucket_size": 4,
+  "total_contacts": 9,
+  "buckets": [
+    {
+      "index": 0,
+      "contacts": [
+        {
+          "node_id": "d40bf654ed4f625b9398f1b31aa8ccba5dbbe8091cdc161240bbfae8198b8b42",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100193fe1fb5e50eb27e1aa6fbea054934204bff23416d6c4dcbebe57cf4ec01115",
+          "host": "127.0.0.1",
+          "port": 9102,
+          "last_seen_ms": 1793035858315,
+          "last_verified_ms": 0
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "contacts": [
+        {
+          "node_id": "339435afaa37a1e3c79b261f8a21fb5f598dede007bb1056d84614132348bcdd",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100a91660032e3a5556a83e952ee5fc36a2360d2235bf71612f8f1bb0e989a34dea",
+          "host": "127.0.0.1",
+          "port": 9103,
+          "last_seen_ms": 1793035858315,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "2482b1c1657f8b4926e40336f560d91111168f1dea8cb8e8eb85351146fc6804",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100c799480d38c42b9329ec1eeb55189865a3e093aaccf6d8525bec63602f122b9c",
+          "host": "127.0.0.1",
+          "port": 9105,
+          "last_seen_ms": 1793035858315,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "32f94b1f689a78f1da2090a6bae775b28ccecb6348fa8bec98e159b0289d5301",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100da2cad560acb7a051842eb0196141fe5d852e8c0b86e9c910f030c966a9fd989",
+          "host": "127.0.0.1",
+          "port": 9101,
+          "last_seen_ms": 1793035858316,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "0439bff3b7a6f2fc99bcf9d5ad4a8e2590f9810826349f3109e306523c69d83b",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100db0a9396df826a8686cb7b4203534f1add62481e4786c229952f084066977e8b",
+          "host": "127.0.0.1",
+          "port": 9106,
+          "last_seen_ms": 1793035858316,
+          "last_verified_ms": 0
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "contacts": [
+        {
+          "node_id": "475979a1e5504a3821c8bdb17897bee8945f0d6d81240062cf9193cefc2b3459",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b65700321001356851444dbd1c3dcd15c1f59bdef56bff5ea3ed76fc5f9deaf5c1df43b2b86",
+          "host": "127.0.0.1",
+          "port": 9112,
+          "last_seen_ms": 1793035858316,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "4b8a33b6bc32a31dfc5efc7278f398c624945ae3fb0d137cd138a245c2e9da65",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100dca656303fe01ef18a3daa9a7213b66982a1f95ebc30193519130708a84f053f",
+          "host": "127.0.0.1",
+          "port": 9119,
+          "last_seen_ms": 1793035859829,
+          "last_verified_ms": 0
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "contacts": [
+        {
+          "node_id": "7aeb39d133dde1589e6d4f0a82f91cbe2941daf6b0f09cc71fa46cd5229d6600",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100e2d5509c72d0db1386c0f40883586af0b0c98e68411d2012207ba03c9da8a3d3",
+          "host": "127.0.0.1",
+          "port": 9108,
+          "last_seen_ms": 1793035858315,
+          "last_verified_ms": 0
+        },
+        {
+          "node_id": "7d8a7f407935bb2ed85e1878de3e3a2b9fa564c520042e085364bdbc611c0f7b",
+          "identity_algorithm": "ed25519",
+          "identity_public_key": "302a300506032b6570032100017e3cd686761473fc7b8b7d96f593770d46658778a1235b184c279f1a07ddbd",
+          "host": "127.0.0.1",
+          "port": 9107,
+          "last_seen_ms": 1793035858315,
+          "last_verified_ms": 0
+        }
+      ]
+    }
+  ]
+}

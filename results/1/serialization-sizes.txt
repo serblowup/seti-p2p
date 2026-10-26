@@ -1,0 +1,7 @@
+=== RUN   TestSerializationSizes
+    bench_test.go:184: PING  payload: json=245 msgpack=184 cbor=189
+    bench_test.go:186: FNR   payload: json=914 msgpack=688 cbor=706
+    bench_test.go:188: ERROR payload: json=50 msgpack=42 cbor=42
+--- PASS: TestSerializationSizes (0.00s)
+PASS
+ok  	seti-p2p/internal/protocol	(cached)

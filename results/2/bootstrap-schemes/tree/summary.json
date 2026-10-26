@@ -1,0 +1,9 @@
+{
+  "scheme": "tree",
+  "N": 20,
+  "K": 4,
+  "alpha": 3,
+  "avg_contacts": 4.85,
+  "avg_nonempty_buckets": 2.95,
+  "nondegeneracy_pass": true
+}

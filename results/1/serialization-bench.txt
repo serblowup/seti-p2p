@@ -1,0 +1,42 @@
+goos: linux
+goarch: amd64
+pkg: seti-p2p/internal/protocol
+cpu: AMD Ryzen 5 7535HS with Radeon Graphics        
+BenchmarkPing_JSON_Encode-12           	 1823197	       658.9 ns/op	     448 B/op	       3 allocs/op
+BenchmarkPing_JSON_Encode-12           	 1819693	       667.5 ns/op	     448 B/op	       3 allocs/op
+BenchmarkPing_JSON_Encode-12           	 1800423	       657.0 ns/op	     448 B/op	       3 allocs/op
+BenchmarkPing_Msgpack_Encode-12        	 2110218	       571.0 ns/op	     592 B/op	       5 allocs/op
+BenchmarkPing_Msgpack_Encode-12        	 2145164	       560.7 ns/op	     592 B/op	       5 allocs/op
+BenchmarkPing_Msgpack_Encode-12        	 2106932	       552.5 ns/op	     592 B/op	       5 allocs/op
+BenchmarkPing_CBOR_Encode-12           	 3981872	       300.8 ns/op	     288 B/op	       2 allocs/op
+BenchmarkPing_CBOR_Encode-12           	 4090614	       304.4 ns/op	     288 B/op	       2 allocs/op
+BenchmarkPing_CBOR_Encode-12           	 3923540	       304.0 ns/op	     288 B/op	       2 allocs/op
+BenchmarkPing_JSON_Decode-12           	  543420	      2019 ns/op	    1161 B/op	      11 allocs/op
+BenchmarkPing_JSON_Decode-12           	  552522	      2012 ns/op	    1161 B/op	      11 allocs/op
+BenchmarkPing_JSON_Decode-12           	  588499	      2032 ns/op	    1161 B/op	      11 allocs/op
+BenchmarkPing_Msgpack_Decode-12        	 1922170	       620.9 ns/op	     240 B/op	       6 allocs/op
+BenchmarkPing_Msgpack_Decode-12        	 1916426	       625.1 ns/op	     240 B/op	       6 allocs/op
+BenchmarkPing_Msgpack_Decode-12        	 1901781	       634.0 ns/op	     240 B/op	       6 allocs/op
+BenchmarkPing_CBOR_Decode-12           	 1590228	       750.5 ns/op	     192 B/op	       5 allocs/op
+BenchmarkPing_CBOR_Decode-12           	 1596278	       747.2 ns/op	     192 B/op	       5 allocs/op
+BenchmarkPing_CBOR_Decode-12           	 1586920	       766.8 ns/op	     192 B/op	       5 allocs/op
+BenchmarkFindNode_JSON_Encode-12       	  676970	      1728 ns/op	    1312 B/op	       3 allocs/op
+BenchmarkFindNode_JSON_Encode-12       	  640357	      1770 ns/op	    1312 B/op	       3 allocs/op
+BenchmarkFindNode_JSON_Encode-12       	  600214	      1755 ns/op	    1312 B/op	       3 allocs/op
+BenchmarkFindNode_Msgpack_Encode-12    	  726644	      1617 ns/op	    2177 B/op	       7 allocs/op
+BenchmarkFindNode_Msgpack_Encode-12    	  667672	      1619 ns/op	    2177 B/op	       7 allocs/op
+BenchmarkFindNode_Msgpack_Encode-12    	  696007	      1618 ns/op	    2177 B/op	       7 allocs/op
+BenchmarkFindNode_CBOR_Encode-12       	 1341124	       883.3 ns/op	     912 B/op	       2 allocs/op
+BenchmarkFindNode_CBOR_Encode-12       	 1335398	       895.2 ns/op	     912 B/op	       2 allocs/op
+BenchmarkFindNode_CBOR_Encode-12       	 1336081	       895.3 ns/op	     912 B/op	       2 allocs/op
+BenchmarkFindNode_JSON_Decode-12       	  189920	      6012 ns/op	    3644 B/op	      23 allocs/op
+BenchmarkFindNode_JSON_Decode-12       	  198343	      5962 ns/op	    3644 B/op	      23 allocs/op
+BenchmarkFindNode_JSON_Decode-12       	  195241	      6009 ns/op	    3644 B/op	      23 allocs/op
+BenchmarkFindNode_Msgpack_Decode-12    	  520707	      2287 ns/op	    1256 B/op	      24 allocs/op
+BenchmarkFindNode_Msgpack_Decode-12    	  459327	      2317 ns/op	    1256 B/op	      24 allocs/op
+BenchmarkFindNode_Msgpack_Decode-12    	  477753	      2269 ns/op	    1256 B/op	      24 allocs/op
+BenchmarkFindNode_CBOR_Decode-12       	  421717	      2646 ns/op	     872 B/op	      20 allocs/op
+BenchmarkFindNode_CBOR_Decode-12       	  405199	      2596 ns/op	     872 B/op	      20 allocs/op
+BenchmarkFindNode_CBOR_Decode-12       	  458250	      2614 ns/op	     872 B/op	      20 allocs/op
+PASS
+ok  	seti-p2p/internal/protocol	54.072s

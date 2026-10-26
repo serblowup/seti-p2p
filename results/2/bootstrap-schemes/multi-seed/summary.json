@@ -1,0 +1,9 @@
+{
+  "scheme": "multi-seed",
+  "N": 20,
+  "K": 4,
+  "alpha": 3,
+  "avg_contacts": 5.05,
+  "avg_nonempty_buckets": 2.85,
+  "nondegeneracy_pass": true
+}
