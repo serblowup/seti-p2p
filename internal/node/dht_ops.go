@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -20,12 +19,13 @@ const ReplicationFactor = 3
 const StoreAckThreshold = 2
 
 type StorePutResult struct {
-	Key        []byte            `json:"key"`
-	Replicas   int               `json:"replicas"`
-	Acks       int               `json:"acks"`
-	Success    bool              `json:"success"`
-	DurationMs int64             `json:"duration_ms"`
-	StoredAt   []routing.Contact `json:"stored_at"`
+	Key         []byte            `json:"key"`
+	Replicas    int               `json:"replicas"`
+	Acks        int               `json:"acks"`
+	Success     bool              `json:"success"`
+	LocalStored bool              `json:"local_stored"`
+	DurationMs  int64             `json:"duration_ms"`
+	StoredAt    []routing.Contact `json:"stored_at"`
 }
 
 func (n *Node) BuildSelfRecord() (*store.NodeRecord, error) {
@@ -60,31 +60,45 @@ func (n *Node) Put(ctx context.Context, rec *store.NodeRecord) (StorePutResult, 
 	}
 	res.Key = key
 
+	localErr := n.store.Put(rec)
+	res.LocalStored = localErr == nil
+
 	lookupRes, err := n.Lookup(ctx, key)
 	if err != nil {
-		return res, fmt.Errorf("put: lookup: %w", err)
+		res.DurationMs = time.Since(start).Milliseconds()
+		if localErr != nil {
+			return res, fmt.Errorf("put: lookup: %w", err)
+		}
+		res.Success = res.Acks >= StoreAckThreshold
+		logPutResult(res)
+		return res, nil
 	}
 
-	candidates := selectReplicas(n.nodeID, lookupRes.Closest, ReplicationFactor-1)
-	if len(candidates) == 0 {
-		return res, errors.New("put: no candidates for replication")
-	}
-
-	if err := n.store.Put(rec); err == nil {
-		res.Acks++
-		res.Replicas++
-		self, _ := n.SelfContact()
-		res.StoredAt = append(res.StoredAt, self)
+	replicas := selectReplicasByXOR(n.nodeID, lookupRes.Closest, ReplicationFactor)
+	if len(replicas) == 0 {
+		res.DurationMs = time.Since(start).Milliseconds()
+		if localErr != nil {
+			return res, fmt.Errorf("put: no candidates for replication and local store failed: %w", localErr)
+		}
+		res.Success = res.Acks >= StoreAckThreshold
+		logPutResult(res)
+		return res, nil
 	}
 
 	type ack struct {
 		c   routing.Contact
 		err error
 	}
-	acks := make(chan ack, len(candidates))
+	acks := make(chan ack, len(replicas))
 	var wg sync.WaitGroup
-	for _, c := range candidates {
+	for _, c := range replicas {
+		res.Replicas++
 		if bytesEqual(c.NodeID, n.nodeID) {
+			if localErr == nil {
+				res.Acks++
+				self, _ := n.SelfContact()
+				res.StoredAt = append(res.StoredAt, self)
+			}
 			continue
 		}
 		wg.Add(1)
@@ -98,7 +112,6 @@ func (n *Node) Put(ctx context.Context, rec *store.NodeRecord) (StorePutResult, 
 	close(acks)
 
 	for a := range acks {
-		res.Replicas++
 		if a.err == nil {
 			res.Acks++
 			res.StoredAt = append(res.StoredAt, a.c)
@@ -107,21 +120,36 @@ func (n *Node) Put(ctx context.Context, rec *store.NodeRecord) (StorePutResult, 
 
 	res.Success = res.Acks >= StoreAckThreshold
 	res.DurationMs = time.Since(start).Milliseconds()
+	logPutResult(res)
+	return res, nil
+}
 
+func logPutResult(res StorePutResult) {
 	storedIDs := make([]string, 0, len(res.StoredAt))
 	for _, c := range res.StoredAt {
 		storedIDs = append(storedIDs, fmt.Sprintf("%x", c.NodeID[:4]))
 	}
-	log.Printf("store put key=%s replicas=%d acks=%d success=%v duration=%dms stored_at=%s",
-		shortID(res.Key), res.Replicas, res.Acks, res.Success, res.DurationMs,
+	log.Printf("store put key=%s replicas=%d acks=%d success=%v local_stored=%v duration=%dms stored_at=%s",
+		shortID(res.Key), res.Replicas, res.Acks, res.Success, res.LocalStored, res.DurationMs,
 		strings.Join(storedIDs, ","))
-
-	return res, nil
 }
 
 func (n *Node) Get(ctx context.Context, key []byte) (*store.NodeRecord, bool, error) {
-	if rec, ok := n.store.Get(key); ok {
-		return rec, true, nil
+	local, hasLocal := n.store.Get(key)
+	if hasLocal {
+		if verr := local.Validate(time.Now(), nil); verr != nil {
+			log.Printf("store get key=%s dropping invalid local record: %v",
+				shortID(key), verr)
+			hasLocal = false
+			local = nil
+		}
+	}
+
+	if n.TableSize() == 0 {
+		if hasLocal {
+			return local, true, nil
+		}
+		return nil, false, nil
 	}
 
 	self, err := n.SelfContact()
@@ -144,10 +172,23 @@ func (n *Node) Get(ctx context.Context, key []byte) (*store.NodeRecord, bool, er
 	}
 
 	if res.Success && res.Record != nil {
-		_ = n.store.Put(res.Record)
-		log.Printf("store get key=%s success=true rpcs=%d iters=%d duration=%dms",
+		if verr := res.Record.Validate(time.Now(), nil); verr != nil {
+			log.Printf("store get key=%s dropping invalid remote record: %v",
+				shortID(key), verr)
+		} else {
+			_ = n.store.Put(res.Record)
+			if !hasLocal || res.Record.SequenceNumber >= local.SequenceNumber {
+				log.Printf("store get key=%s success=true source=remote rpcs=%d iters=%d duration=%dms",
+					shortID(key), res.RPCs, res.Iterations, res.DurationMs)
+				return res.Record, true, nil
+			}
+		}
+	}
+
+	if hasLocal {
+		log.Printf("store get key=%s success=true source=local rpcs=%d iters=%d duration=%dms",
 			shortID(key), res.RPCs, res.Iterations, res.DurationMs)
-		return res.Record, true, nil
+		return local, true, nil
 	}
 
 	log.Printf("store get key=%s success=false rpcs=%d iters=%d duration=%dms",
@@ -192,12 +233,12 @@ func (n *Node) sendStore(ctx context.Context, target routing.Contact, rec *store
 	return nil
 }
 
-func selectReplicas(selfID []byte, closest []routing.Contact, k int) []routing.Contact {
-	out := make([]routing.Contact, 0, k+1)
+func selectReplicasByXOR(selfID []byte, closest []routing.Contact, k int) []routing.Contact {
+	if k <= 0 || len(closest) == 0 {
+		return nil
+	}
+	out := make([]routing.Contact, 0, k)
 	for _, c := range closest {
-		if bytesEqual(c.NodeID, selfID) {
-			continue
-		}
 		out = append(out, c)
 		if len(out) == k {
 			break

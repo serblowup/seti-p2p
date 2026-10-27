@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,5 +326,65 @@ func TestStorePersistsAcrossRestart(t *testing.T) {
 	}
 	if got.SequenceNumber != rec.SequenceNumber {
 		t.Fatalf("seq mismatch after restart")
+	}
+}
+
+func TestFindValueDropsInvalidStoredRecord(t *testing.T) {
+	seed, client1, _ := newThreeNodes(t)
+
+	rec, _ := buildTestRecord(t)
+	key, err := rec.Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Signature[0] ^= 0xff
+	seed.PutLocalUnchecked(rec)
+
+	seedContact := selfContact(t, seed)
+	client1Contact := selfContact(t, client1)
+
+	fv := callFindValue(t, seedContact, client1Contact, key)
+	if fv.Record != nil {
+		t.Fatal("FIND_VALUE must not return record with invalid signature")
+	}
+	if len(fv.Contacts) == 0 {
+		t.Fatal("FIND_VALUE must return contacts when stored record is invalid")
+	}
+}
+
+func TestFindValueRejectsBadKeyLength(t *testing.T) {
+	seed, client1, _ := newThreeNodes(t)
+
+	seedContact := selfContact(t, seed)
+	client1Contact := selfContact(t, client1)
+
+	shortKey := make([]byte, 16)
+	payload, err := protocol.EncodePayload(protocol.FindValueRequestPayload{
+		Sender: client1Contact.ToWire(),
+		Key:    shortKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &protocol.Frame{
+		Version:   1,
+		Type:      protocol.TypeFindValueRequest,
+		RequestID: protocol.NewRequestID(),
+		Payload:   payload,
+	}
+
+	client := &transport.RPCClient{
+		ProtoVersion: 1,
+		MaxPayload:   protocol.MaxFramePayload,
+		ConnectTO:    1 * time.Second,
+		ReadTO:       1 * time.Second,
+	}
+	_, err = client.Call(context.Background(), seedContact, req, protocol.TypeFindValueResponse)
+	if err == nil {
+		t.Fatal("expected error for FIND_VALUE with key length 16")
+	}
+	if !strings.Contains(err.Error(), "find_value key") && !strings.Contains(err.Error(), "handler_error") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

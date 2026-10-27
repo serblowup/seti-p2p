@@ -8,8 +8,8 @@
 основе пиринговых протоколов».
 **Текущий статус:** этапы 1–3 завершены (транспорт, кадрирование,
 идентичность, Kademlia DHT, bootstrap, `PING`, `FIND_NODE`, `STORE`,
-`FIND_VALUE`, подписанные `NodeRecord`, репликация `R = 3`, TTL,
-переопубликование, псевдонимы).
+`FIND_VALUE`, подписанные `NodeRecord`, репликация `R = 3`,
+TTL, переопубликование, псевдонимы).
 **Уровень:** продвинутый (`N = 20`, `K = 4`, `R = 3`, четыре
 bootstrap-схемы).
 
@@ -49,12 +49,24 @@ bootstrap-схемы).
   (`seti-p2p/record/v1`) и Ed25519-подписью.
 - Локальное хранилище DHT с персистентностью в `state_dir/dht-store.json`.
 - `STORE` / `FIND_VALUE` как RPC в кадре версии 1 (`0x05–0x08`).
-- Репликация `R = 3`: владелец + до двух удалённых хранителей;
-  успех при `acks >= 2`.
+- Репликация `R = 3` — **три ближайших по XOR** хранителя из `Lookup`;
+  владелец входит в тройку только если попал по XOR. Локальная копия
+  владельца ведётся отдельно (`LocalStored`), не считается репликой,
+  если владелец не в тройке. Успех при `acks >= 2`.
 - TTL записей, очистка истёкших, защита от отката `sequence_number`.
-- Переопубликование владельцем раз в `TTL/2` с пересборкой записи.
+- Переопубликование владельцем раз в `TTL/2` с пересборкой записи;
+  не зависит от кворума (`LocalStored=true` даже при `Success=false`).
 - Псевдонимы с нормализацией и детерминированным DHT-ключом
   `SHA-256("alias:" || normalized)`.
+- Валидация адресов IPv4 / IPv6 / hostname через `internal/netutil`;
+  IPv6 — в скобках (`[::1]:9101`), «почти IPv4» (`127.000.000.001`)
+  отклоняется.
+- `Validate(time.Now(), nil)` для истёкших/битых/устаревших записей
+  в `dht.FindValue.Run`, `handleFindValue`, `node.Get`.
+- `node.Get` всегда идёт в `FindValue` (если `TableSize() > 0`),
+  локальная устаревшая копия не перекрывает удалённую.
+- `Stop()`: `cancel → bgWG.Wait → closeConns → connWG.Wait → SaveToDisk`;
+  снимок содержит последние изменения от фоновых публикаций.
 - Сценарий отказа именно хранителя (`scripts/store_experiment.sh`).
 
 ### Что НЕ реализовано (границы этапов 1–3)
@@ -80,7 +92,6 @@ bootstrap-схемы).
   `date +%s%N`.
 - (Опционально) **column** (util-linux) — для выравнивания
   `bootstrap-comparison.txt`; при отсутствии используется `cat`.
-- (Опционально) **OpenSSL** — для внешней проверки сертификатов.
 - (Опционально) **Docker** и **docker-compose** — не используются на
   этапах 1–3, но заготовлены для будущих этапов.
 
@@ -104,14 +115,17 @@ go test ./tests/unit/... -v
 go test ./tests/integration/... -v
 ```
 
-Ожидаемый результат: **78 unit-тестов** и **38 integration-тестов**
-проходят без ошибок (числа актуальны после доработок этапов 1–2).
-Точные числа можно получить:
+Ожидаемый результат: **101 unit-тест** и **42 integration-теста**
+проходят без ошибок. Точные числа можно получить:
 
 ```bash
 go test ./tests/unit/ -v | grep -c '^--- PASS'
 go test ./tests/integration/ -v | grep -c '^--- PASS'
 ```
+
+`tests/integration` на продвинутом уровне (`N = 20, K = 4`) идёт
+~25–30 секунд из-за подъёма 20 узлов в `dht_ops_test.go` и
+`e2e_test.go`.
 
 ---
 
@@ -147,16 +161,9 @@ NODES=5 K=3 SCHEME=star ./scripts/demo.sh
 ### 5.1. Демонстрация на продвинутом уровне (20 узлов, K=4)
 
 ```bash
-# Star
 NODES=20 K=4 SCHEME=star ./scripts/demo.sh
-
-# Ring
 NODES=20 K=4 SCHEME=ring ./scripts/demo.sh
-
-# Tree
 NODES=20 K=4 SCHEME=tree ./scripts/demo.sh
-
-# Multi-seed (4 seed-узла, клиенты знают по 2 seed-узла)
 NODES=20 K=4 SCHEME=multi-seed ./scripts/demo.sh
 ```
 
@@ -255,13 +262,13 @@ NODES=20 K=4 SCHEME=star RUNS=50 KILL_REPLICA=1 ./scripts/store_experiment.sh
 
 # Все четыре схемы
 for s in star ring tree multi-seed; do
-  NODES=20 K=4 SCHEME=$s RUNS=50 KILL_REPLICA=1 ./scripts/store_experiment.sh
+  NODES=20 K=4 ALPHA=3 SCHEME=$s RUNS=50 KILL_REPLICA=1 ./scripts/store_experiment.sh
 done
 ```
 
 Скрипт:
 
-1. Поднимает сеть `N = 20`.
+1. Поднимает сеть `N = 20, K = 4`.
 2. Каждый узел публикует свою запись через `-publish-self`.
 3. Собирает ключи из логов.
 4. При `KILL_REPLICA=1` находит в логе `store put` список
@@ -277,6 +284,10 @@ done
 7. Печатает в summary строку
    `victim_key=<short> reads=<N> success=<M>` — прямое
    подтверждение E3-5 из сырых данных.
+
+В логах `store put` появилось `local_stored=true/false`; `stored_at`
+может **не** содержать владельца, если владелец не попал в тройку
+ближайших по XOR.
 
 Результаты: `results/3/<scheme>-store.csv`,
 `results/3/<scheme>-store.txt`.
@@ -345,6 +356,11 @@ export SETI_WRITE_TIMEOUT_MS=5000
 без порта, `SETI_BOOTSTRAP_PEERS=127.0.0.1:abc` и т. п.) возвращает
 ошибку из `config.Load`, узел не стартует.
 
+Адреса в `SETI_BOOTSTRAP_PEERS` проходят через
+`netutil.ValidateHostPort`: поддерживаются IPv4, IPv6 в скобках
+(`[::1]:9101`), RFC 1123 hostname; «почти IPv4» (`127.000.000.001`)
+и мусор отклоняются.
+
 ---
 
 ## 7. Запуск одного узла
@@ -390,7 +406,6 @@ NODES=2 K=4 SCHEME=star HOLD=1 ./scripts/demo.sh
 в каталоге состояния:
 
 ```bash
-# Положить hex целевого NodeID в файл
 echo -n "6acf086a..." > state-star/node-02/lookup.trigger
 ```
 
@@ -418,6 +433,7 @@ seti-p2p/
 ├── internal/
 │   ├── config/
 │   ├── identity/
+│   ├── netutil/
 │   ├── protocol/
 │   ├── routing/
 │   ├── transport/
@@ -469,9 +485,11 @@ seti-p2p/
 │   ├── unit/
 │   │   ├── bucket_test.go
 │   │   ├── config_test.go
+│   │   ├── find_value_validation_test.go
 │   │   ├── frame_test.go
 │   │   ├── identity_test.go
 │   │   ├── negative_test.go
+│   │   ├── netutil_test.go
 │   │   ├── pong_validation_test.go
 │   │   ├── protocol_test.go
 │   │   ├── routing_test.go
@@ -520,6 +538,10 @@ go test ./tests/unit/... -v
 - идентичность: устойчивость `NodeID`, соответствие ключу, сверка
   `priv.Public()` с загруженным `pub`, отклонение рассинхронизированных
   `identity.key`/`identity.pub`, падение `node.New`;
+- адреса: `TestValidateHostPortIPv4`, `TestValidateHostPortIPv6`,
+  `TestValidateHostPortIPv6Unbracketed`, `TestValidateHostPortHostname`,
+  `TestValidateHostPortRejects` — IPv4/IPv6/hostname, нормализация,
+  отклонение «почти IPv4» и мусора;
 - payload: round-trip всех типов, строгая валидация;
 - XOR-метрика и k-bucket: вставка, `Touch`, `LRU`, `ReplaceLRU`,
   `Remove`;
@@ -533,10 +555,12 @@ go test ./tests/unit/... -v
   mismatched responder, valid pong);
 - `NodeRecord`: канонизация, подпись, `Validate`;
 - локальное хранилище: `Put`/`Get`, откат версии, TTL, персистентность;
+- `dht.FindValue.Run`: `TestFindValueRejectsExpiredRemoteRecord` —
+  истёкшая запись от удалённого хранителя не принимается;
 - конфигурация: 17 подтестов `TestConfigValidateRejects` + 12
   тестов `TestConfigLoad*` (включая ошибочные `SETI_*`).
 
-Итого **78 unit-тестов**.
+Итого **101 unit-тест**.
 
 ### Integration-тесты
 
@@ -546,8 +570,9 @@ go test ./tests/integration/... -v
 
 Покрывают:
 
-- `TestBootstrapAndLookup` — пять узлов, bootstrap через seed, lookup
-  через промежуточный узел;
+- `TestBootstrapAndLookup` — параметризованный: `smoke_N5_K3`
+  (может скипнуть, если пара не нашлась) и `advanced_N20_K4`
+  (обязательный, `rpcs >= 2`, `N=20, K=4`);
 - `TestSeedFailureDoesNotBlockLookup` — пять узлов, отказ seed, lookup
   между двумя клиентами после отказа;
 - `TestLookupDistinguishesDiscoveredAndResponded`,
@@ -567,14 +592,23 @@ go test ./tests/integration/... -v
   `TestNodeObserveKeepsOldAddressIfNewUnreachable` — обновление и
   откат адреса контакта;
 - `TestStoreThenFindValue`, `TestFindValueMissReturnsContacts`,
-  `TestStoreRejectsRollbackOverNetwork`, `TestStorePersistsAcrossRestart`;
-- `TestPutThenGetAcrossNodes`, `TestGetAfterReplicaFailure`,
-  `TestPutLocalOnlyOnThreeNodes`, `TestPutReplicasCountsOwner`;
-- `TestPutAliasThenGetByAlias`, `TestAliasLastWriterWins`,
-  `TestPutAliasRejects*`, `TestGetAlias*`;
-- `TestRepublishExtendsTTL`.
+  `TestStoreRejectsRollbackOverNetwork`, `TestStorePersistsAcrossRestart`,
+  `TestFindValueDropsInvalidStoredRecord` — `handleFindValue` не отдаёт
+  битую запись, возвращает `contacts`;
+- `TestPutThenGetAcrossNodes` (`source=remote`),
+  `TestGetAfterReplicaFailure`, `TestPutLocalOnlyOnThreeNodes`,
+  `TestPutReplicasByXOR`, `TestPutOwnerLocalEvenIfNotInReplicaSet`
+  (`owner in replica set: false`, `N=20, K=4`),
+  `TestGetRejectsExpiredRemoteRecord` — `Put`/`Get` на продвинутом
+  уровне;
+- `TestPutAliasThenGetByAlias`, `TestAliasLastWriterWins`
+  (`source=remote node=c2`), `TestPutAliasRejects*`, `TestGetAlias*`;
+- `TestRepublishExtendsTTL` (при `N=2`: `replicas=1 acks=1 success=false
+  local_stored=true`, но TTL продлён), `TestStopSavesFinalStoreState`
+  (при `N=1`: `replicas=0 acks=0 success=false local_stored=true`,
+  снимок содержит новую версию после `Stop`).
 
-Итого **38 integration-тестов**.
+Итого **42 integration-теста**.
 
 ### Бенчмарки
 
@@ -588,6 +622,11 @@ go test ./internal/protocol/ -bench . -benchmem -run '^$' -count=3
 go test ./... -count=1
 ```
 
+При `go test -short ./tests/integration/...` пропускаются длинные
+тесты (`TestRepublishExtendsTTL`, `TestStopSavesFinalStoreState`),
+но `dht_ops_test.go` и `e2e_test.go` **всегда** идут с `N = 20, K = 4`
+(без `-short`-вариантов).
+
 ---
 
 ## 11. Документация
@@ -596,7 +635,8 @@ go test ./... -count=1
   инженерные решения, ограничения, задел на этапы 4–5.
 - **`docs/Protocol.md`** — формат кадра, типы сообщений, схемы payload,
   правила `NodeID`, устройство `RoutingTable`, алгоритм lookup,
-  схемы bootstrap, `STORE`/`FIND_VALUE`, `NodeRecord`.
+  схемы bootstrap, `STORE`/`FIND_VALUE`, `NodeRecord`, IPv6 в
+  адресах, `LocalStored`.
 - **`docs/Node record.md`** — формат подписанной адресной записи,
   канонизация, подпись, TTL, псевдонимы, ограничения модели.
 - **`docs/Serialization comparison.md`** — сравнение JSON, MessagePack,
@@ -650,10 +690,10 @@ go test ./... -count=1
 
 | Схема | Success | avg rpcs | avg iters | avg duration | median duration | `victim_key` reads / success | `non_victim` reads / success |
 |---|---:|---:|---:|---:|---:|---|---|
-| `star` | 39/50 | 6.31 | 2.10 | 1.21 ms | 1.00 ms | 28 / 23 (82%) | 22 / 16 |
-| `ring` | 44/50 | 6.68 | 2.41 | 1.34 ms | 1.00 ms | 25 / 25 (100%) | 25 / 19 |
-| `tree` | 38/50 | 6.55 | 2.18 | 1.26 ms | 1.00 ms | 25 / 18 (72%) | 25 / 20 |
-| `multi-seed` | 42/50 | 7.60 | 2.55 | 1.55 ms | 2.00 ms | 25 / 25 (100%) | 25 / 17 |
+| `star` | 49/50 | 7.02 | 2.49 | 1.20 ms | 1.00 ms | 27 / 27 (100%) | 23 / 22 (96%) |
+| `ring` | 49/50 | 7.90 | 2.80 | 1.18 ms | 1.00 ms | 25 / 25 (100%) | 25 / 24 (96%) |
+| `tree` | 50/50 | 7.12 | 2.56 | 1.12 ms | 1.00 ms | 26 / 26 (100%) | 24 / 24 (100%) |
+| `multi-seed` | 39/50 | 7.95 | 2.74 | 1.41 ms | 2.00 ms | 25 / 15 (60%) | 25 / 24 (96%) |
 
 Столбец `is_victim_key` в CSV (`1`, если `target_key == VICTIM_KEY`)
 позволяет автоматически подсчитать, сколько раз читался ключ убитого
@@ -667,16 +707,29 @@ go test ./... -count=1
 
 `TTL = 4 с`, `republishInterval = 2 с`. Через 5 секунд после
 `PutLocal` запись жива, `ExpiresAt` сдвинут вперёд, `SequenceNumber`
-увеличен. Тест занимает ~5.0 секунды, при `go test -short`
-пропускается.
+увеличен. При `N=2` лог показывает `replicas=1 acks=1 success=false
+local_stored=true` — второй узел не попал в тройку ближайших по XOR,
+но `LocalStored=true`, `SequenceNumber` обновлён локально, TTL продлён.
+Тест занимает ~5.0 секунды, при `go test -short` пропускается.
+
+### `TestStopSavesFinalStoreState`
+
+Узел с `TTL = 4 с`, `republishInterval = 2 с`. Через 3 секунды после
+`PutLocal` `republishOnce` срабатывает, `SequenceNumber` увеличивается.
+Затем `Stop()`: `cancel → bgWG.Wait → closeConns → connWG.Wait →
+SaveToDisk`. После рестарта из того же `StateDir` `StoreGet` возвращает
+**последнюю** версию. При `N=1` лог показывает `replicas=0 acks=0
+success=false local_stored=true` — тройка пуста, но `LocalStored=true`
+и снимок содержит новую версию.
 
 ### Псевдонимы
 
-- `PutAlias` / `GetAlias` на четырёх узлах: `alice` → `ALICE` → `alice`.
+- `PutAlias` / `GetAlias` на `N = 20`: `alice` → `ALICE` → `alice`,
+  `source=remote`.
 - `TestAliasLastWriterWins` подтверждает локальный last-writer-wins
   на стороне хранителя: `sequence_number` 1 → 2 вытесняет
-  предыдущую версию. Тест использует `BuildSelfRecordWithSeq` для
-  детерминированного `SequenceNumber`.
+  предыдущую версию, `GetAlias` возвращает `c2` (`source=remote`),
+  а не устаревшую локальную копию `seed` от `c1`.
 - `PutAlias` отклоняет чужую запись (`ErrAliasNotOwn`), запись
   с уже установленным `alias` (`ErrAliasAlreadySet`) и запись,
   не прошедшую `Validate` (`alias: invalid record: …`).
@@ -708,12 +761,14 @@ go test ./... -count=1
   сценарий рабочей сети. Остальные тесты E2-4 (`TestPingDoesNotBlockOnLRUCheck`,
   `TestObservePromotesAliveLRUAsync`, `TestObserveReplacesDeadLRUAsync`)
   используют реальные узлы.
+- **IPv6 поддерживается** в скобках (`[::1]:9101`); unbracketed IPv6
+  (`::1:9101`) отклоняется, IPv4-mapped IPv6 (`::ffff:127.0.0.1`)
+  нормализуется в IPv4.
 
 ---
 
 ## 15. Дальнейшие этапы
 
-- **Доработка этапа 3.**
 - **Этап 4.** TLS 1.3 с mutual auth (упрощённый) или собственный AKE
   на Ed25519/X25519/HKDF/AEAD (продвинутый).
 - **Этап 5.** Туннельная ретрансляция (`TUNNEL_BUILD`, `TUNNEL_DATA`,

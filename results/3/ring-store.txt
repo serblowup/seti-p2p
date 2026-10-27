@@ -1,0 +1,13 @@
+scheme=ring nodes=20 runs=50 ok=49
+killed_replica=node-02 key=e1b9c4db
+victim_key=e1b9c4db reads=25 success=25
+non_victim_reads=25 non_victim_success=24
+
+raw CSV: results/3/ring-store.csv
+
+aggregates
+successful runs: 49
+avg rpcs:        7.90
+avg iters:       2.80
+avg duration:    1.18 ms
+median duration: 1.00 ms

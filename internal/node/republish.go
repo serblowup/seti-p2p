@@ -15,11 +15,13 @@ func (n *Node) republishInterval() time.Duration {
 const expireInterval = 30 * time.Second
 
 func (n *Node) runMaintenance(ctx context.Context) {
+	n.bgWG.Add(2)
 	go n.republishLoop(ctx)
 	go n.expireLoop(ctx)
 }
 
 func (n *Node) republishLoop(ctx context.Context) {
+	defer n.bgWG.Done()
 	t := time.NewTicker(n.republishInterval())
 	defer t.Stop()
 	for {
@@ -51,6 +53,7 @@ func (n *Node) republishOnce(ctx context.Context) {
 }
 
 func (n *Node) expireLoop(ctx context.Context) {
+	defer n.bgWG.Done()
 	t := time.NewTicker(expireInterval)
 	defer t.Stop()
 	for {

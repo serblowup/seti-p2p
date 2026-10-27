@@ -11,7 +11,9 @@ import (
 )
 
 func TestPutAliasThenGetByAlias(t *testing.T) {
-	_, c1, c2, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
+	c2 := clients[1]
 
 	ctx := context.Background()
 
@@ -60,7 +62,9 @@ func TestAliasKeyStableAcrossNormalization(t *testing.T) {
 }
 
 func TestPutAliasRejectsForeignRecord(t *testing.T) {
-	_, c1, c2, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
+	c2 := clients[1]
 
 	ctx := context.Background()
 
@@ -75,7 +79,8 @@ func TestPutAliasRejectsForeignRecord(t *testing.T) {
 }
 
 func TestPutAliasRejectsAlreadySetAlias(t *testing.T) {
-	_, c1, _, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
 
 	ctx := context.Background()
 
@@ -91,7 +96,8 @@ func TestPutAliasRejectsAlreadySetAlias(t *testing.T) {
 }
 
 func TestPutAliasRejectsInvalidRecord(t *testing.T) {
-	_, c1, _, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
 
 	ctx := context.Background()
 
@@ -107,7 +113,8 @@ func TestPutAliasRejectsInvalidRecord(t *testing.T) {
 }
 
 func TestPutAliasRejectsInvalidAddress(t *testing.T) {
-	_, c1, _, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
 
 	ctx := context.Background()
 
@@ -123,7 +130,9 @@ func TestPutAliasRejectsInvalidAddress(t *testing.T) {
 }
 
 func TestAliasLastWriterWins(t *testing.T) {
-	seed, c1, c2, _ := newFourNodesForPut(t)
+	seed, clients := newNodesForPut(t)
+	c1 := clients[0]
+	c2 := clients[1]
 
 	ctx := context.Background()
 
@@ -157,7 +166,8 @@ func TestAliasLastWriterWins(t *testing.T) {
 }
 
 func TestGetAliasNotFound(t *testing.T) {
-	_, _, c2, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c2 := clients[1]
 
 	ctx := context.Background()
 
@@ -171,7 +181,8 @@ func TestGetAliasNotFound(t *testing.T) {
 }
 
 func TestGetAliasRejectsInvalid(t *testing.T) {
-	_, c1, _, _ := newFourNodesForPut(t)
+	_, clients := newNodesForPut(t)
+	c1 := clients[0]
 
 	ctx := context.Background()
 
@@ -194,4 +205,43 @@ func mustNormalize(t *testing.T, raw string) string {
 		t.Fatalf("NormalizeAlias(%q): %v", raw, err)
 	}
 	return n
+}
+
+func TestAliasConflictDifferentOwners(t *testing.T) {
+	seed, clients := newNodesForPut(t)
+	c1 := clients[0]
+	c2 := clients[1]
+
+	ctx := context.Background()
+
+	rec1, err := c1.BuildSelfRecord()
+	if err != nil {
+		t.Fatalf("c1 BuildSelfRecord: %v", err)
+	}
+	rec2, err := c2.BuildSelfRecordWithSeq(rec1.SequenceNumber + 1)
+	if err != nil {
+		t.Fatalf("c2 BuildSelfRecordWithSeq: %v", err)
+	}
+
+	if _, err := c1.PutAlias(ctx, "conflict", rec1); err != nil {
+		t.Fatalf("c1 PutAlias: %v", err)
+	}
+	if _, err := c2.PutAlias(ctx, "conflict", rec2); err != nil {
+		t.Fatalf("c2 PutAlias: %v", err)
+	}
+
+	got, ok, err := seed.GetAlias(ctx, "conflict")
+	if err != nil {
+		t.Fatalf("GetAlias: %v", err)
+	}
+	if !ok {
+		t.Fatal("GetAlias returned false")
+	}
+	if !bytes.Equal(got.NodeID, c2.NodeID()) {
+		t.Fatalf("conflict resolution broken: got owner=%x, want c2=%x",
+			got.NodeID[:4], c2.NodeID()[:4])
+	}
+	if got.SequenceNumber != rec2.SequenceNumber {
+		t.Fatalf("got seq=%d, want %d", got.SequenceNumber, rec2.SequenceNumber)
+	}
 }

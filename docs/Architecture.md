@@ -40,11 +40,15 @@
   в `results/2/bootstrap-schemes/`;
 - воспроизводимая сравнительная оценка форматов сериализации;
 - подписанные `NodeRecord` с каноническим представлением;
-- локальное хранилище DHT;
-- репликация `R = 3` с порогом `acks >= 2`;
+- локальное хранилище DHT с персистентностью в `state_dir/dht-store.json`;
+- репликация `R = 3` — три ближайших по XOR хранителя; локальная
+  копия владельца ведётся отдельно (`LocalStored`);
 - TTL, защита от отката `sequence_number`, переопубликование владельцем;
 - псевдонимы с нормализацией и детерминированным DHT-ключом;
-- сценарий отказа именно хранителя (`store_experiment.sh`).
+- сценарий отказа именно хранителя (`store_experiment.sh`);
+- валидация адресов IPv4 / IPv6 / hostname через `internal/netutil`;
+- `Stop()` сохраняет итоговое состояние хранилища после завершения
+  фоновых публикаций.
 
 ### 1.2. Что не реализовано (границы этапов)
 
@@ -104,6 +108,8 @@ seti-p2p/
 │   ├── config/               # парсинг конфигурации + env + Validate
 │   ├── identity/             # Ed25519, NodeID, загрузка/сохранение ключей,
 │   │                         # сверка pub/priv при load
+│   ├── netutil/              # ValidateHostPort: IPv4/IPv6/hostname,
+│   │                         # нормализация адресов
 │   ├── protocol/             # кадр, типы, JSON-кодеки, альтернативные кодеки
 │   ├── routing/              # Contact, XOR, k-bucket, RoutingTable
 │   │                         # (sync.Mutex, TouchOrUpdate, addressChanged)
@@ -134,11 +140,12 @@ seti-p2p/
 ├── results/
 │   ├── 1/                   # serialization-sizes.txt, serialization-bench.txt
 │   ├── 2/                   # <scheme>-lookups.*, bootstrap-schemes/
-│   └── 3/                   # <scheme>-store.*
+│   └── 3/                   # <scheme>-store.csv, <scheme>-store.txt
 └── tests/
     ├── unit/                 # кадр, config, identity, bucket, payload,
     │                         # negative, pong_validation, routing,
-    │                         # store, store_record
+    │                         # store, store_record, netutil,
+    │                         # find_value_validation
     └── integration/          # e2e, negative_sender, lookup_stop,
                               # observe, observe_async, address_update,
                               # STORE/FIND_VALUE, dht_ops, alias, republish
@@ -178,8 +185,9 @@ seti-p2p/
 │                                             │  сверка pub/priv при load,
 │                                             │  кадр, JSON-кодеки
 ├─────────────────────────────────────────────┤
-│ internal/transport                          │  TCP, RPC-клиент,
-│                                             │  WriteFrameWithDeadline
+│ internal/transport     internal/netutil     │  TCP, RPC-клиент,
+│                                             │  WriteFrameWithDeadline;
+│                                             │  ValidateHostPort
 ├─────────────────────────────────────────────┤
 │ internal/config                             │  парсинг конфигурации,
 │                                             │  Validate, applyEnv
@@ -188,6 +196,8 @@ seti-p2p/
 
 **Правила зависимостей:**
 
+- `netutil` зависит только от стандартной библиотеки (`net`,
+  `strconv`, `strings`). Используется из `store` и `config`.
 - `protocol` зависит от стандартной библиотеки, от `altcodecs.go`
   (msgpack/cbor) и от `store` (для `StoreRequestPayload.Record`
   и `FindValueResponsePayload.Record`). Это осознанное отступление от
@@ -199,8 +209,8 @@ seti-p2p/
   (для проверки `NodeID`). `RoutingTable` защищена `sync.Mutex`.
   `TouchOrUpdate` возвращает старый контакт до перезаписи адреса.
 - `store` зависит от `identity` (для `ParsePublicKeyDER`,
-  `VerifyNodeID`) и стандартной библиотеки. Не зависит от `protocol`,
-  `routing`, `dht`, `node`.
+  `VerifyNodeID`), `netutil` (для `ValidateHostPort`) и стандартной
+  библиотеки. Не зависит от `protocol`, `routing`, `dht`, `node`.
 - `dht` зависит от `routing`, `protocol`, `transport`, `config`,
   `store` (для `FindValueResult.Record`), но **не имеет доступа** к
   `RoutingTable`: работает с неизменяемым снимком `InitialCandidates`
@@ -286,10 +296,13 @@ RPC завершается ошибкой, и код возвращает упр
 
 `Stop()` закрывает listener, вызывает `cancel()` на `baseCtx`
 (закрывает `watchCtx`, который закрывает listener и соединения),
-закрывает все активные соединения через `closeConns()` и ждёт
-`connWG`. Отмена контекста без `Stop()` также закрывает listener
-и соединения через `watchCtx`. Проверяется
-`TestStop*` и `TestStartCancel*`.
+дожидается завершения фоновых горутин (`bgWG.Wait()` — `republishLoop`
+и `expireLoop`), закрывает все активные соединения через `closeConns()`,
+дожидается `connWG.Wait()` и только затем вызывает `SaveToDisk()`.
+Такой порядок гарантирует, что снимок хранилища содержит последние
+изменения от фоновых публикаций. Отмена контекста без `Stop()` также
+закрывает listener и соединения через `watchCtx`. Проверяется
+`TestStop*`, `TestStartCancel*` и `TestStopSavesFinalStoreState`.
 
 ---
 
@@ -402,8 +415,6 @@ DER SPKI выбран как компромисс: он самодостаточ
 `LoadOrCreate` также различает три случая: оба файла есть → `load`;
 только один есть → явная ошибка (`identity.key exists but identity.pub
 missing` / наоборот); оба отсутствуют → генерация новой пары.
-Раньше при наличии только `identity.pub` узел генерировал новую пару
-и затирал старый `identity.pub`; теперь это ошибка.
 
 Покрыто `TestIdentityLoadRejectsMismatchedKeys`,
 `TestIdentityLoadAcceptsMatchingKeys`, `TestIdentityLoadRejectsMissingPub`,
@@ -417,8 +428,9 @@ missing` / наоборот); оба отсутствуют → генераци
 создать только владелец соответствующего приватного ключа.
 
 `Verify()` проверяет `NodeID ↔ pubkey`, подпись и длину подписи.
-`Validate()` дополнительно проверяет TTL, адреса и монотонность
-`sequence_number`. Подробности — в `docs/NodeRecord.md`.
+`Validate()` дополнительно проверяет TTL, адреса (через
+`netutil.ValidateHostPort`) и монотонность `sequence_number`.
+Подробности — в `docs/Node record.md`.
 
 ---
 
@@ -609,9 +621,12 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 Отличия:
 
 - отправляет `FIND_VALUE_REQUEST`, а не `FIND_NODE_REQUEST`;
-- при получении `Record` в ответе сохраняет его и **продолжает**
-  поиск до `k` ответивших, чтобы обнаружить более новую версию
-  у другого хранителя;
+- при получении `Record` в ответе вызывает `Validate(time.Now(), nil)`
+  (не `Verify()`): истёкшая, с будущим `issued_at`, с плохими адресами
+  или ненормализованным alias запись от удалённого хранителя **не
+  принимается**;
+- сохраняет запись и **продолжает** поиск до `k` ответивших, чтобы
+  обнаружить более новую версию у другого хранителя;
 - возвращает `FindValueResult` с полями `Key`, `Success`, `Record`,
   `Closest`, `RPCs`, `Iterations`, `Timeouts`, `Responded`,
   `DurationMs`, `Trace`, `Discovered`.
@@ -627,7 +642,7 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 
 Подписанная адресная запись, связывающая `NodeID` владельца с его
 адресами и (опционально) псевдонимом. Формат, канонизация, подпись
-и валидация описаны в `docs/NodeRecord.md`.
+и валидация описаны в `docs/Node record.md`.
 
 Ключевые свойства:
 
@@ -638,8 +653,9 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 - подпись Ed25519 над каноническими байтами без `signature`;
 - DHT-ключ: `SHA-256("node:" || NodeID)` или
   `SHA-256("alias:" || normalize(alias))`;
-- `Validate(now, prev)` проверяет подпись, TTL, адреса, `issued_at`
-  и монотонность `sequence_number`.
+- `Validate(now, prev)` проверяет подпись, TTL, адреса (через
+  `netutil.ValidateHostPort`), `issued_at` и монотонность
+  `sequence_number`.
 
 ### 8.2. Локальное хранилище
 
@@ -653,6 +669,8 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 - `DeleteExpired()` — удаляет истёкшие, возвращает число;
 - `Snapshot()` — копия всех записей для экспорта;
 - `OwnRecords(owner)` — записи владельца (для `republish`);
+- `PutUnchecked(rec)` — кладёт запись **без** `Validate`; используется
+  только в тестах защиты в глубину (`TestFindValueDropsInvalidStoredRecord`);
 - `SaveToDisk()` / `LoadFromDisk()` — персистентность в
   `state_dir/dht-store.json` через атомарный `os.Rename`.
   `LoadFromDisk` пропускает истёкшие и повреждённые записи.
@@ -662,35 +680,62 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 `node.Put(ctx, rec)`:
 
 1. `rec.Key()`;
-2. `n.Lookup(ctx, key)` — до `k` ближайших;
-3. `selectReplicas(self, closest, R-1)` — до двух удалённых
-   кандидатов (self считается отдельно);
-4. `store.Put(rec)` — владелец всегда пытается положить запись
-   локально; при ошибке `Validate` запись у него не сохраняется,
-   и владелец не входит в `Replicas`;
-5. параллельные `STORE_REQUEST` двум удалённым кандидатам;
+2. `n.store.Put(rec)` — **первым**, до `Lookup`; `res.LocalStored =
+   (localErr == nil)`. Локальная копия ведётся для `republishLoop`
+   и `SaveToDisk`, **не** считается репликой, если владелец не попал
+   в тройку ближайших по XOR;
+3. `n.Lookup(ctx, key)` — до `K` ближайших;
+4. `selectReplicasByXOR(lookupRes.Closest, R)` — до `R = 3` ближайших
+   по XOR, **включая владельца, если он в тройке**;
+5. параллельные `STORE_REQUEST` выбранным репликам; для `self` в
+   тройке — `Acks++` только если локальный `Put` прошёл;
 6. `Success = acks >= StoreAckThreshold` (`StoreAckThreshold = 2`);
-7. журнал `store put key=… replicas=… acks=… success=… stored_at=…`.
+7. журнал `store put key=… replicas=… acks=… success=… local_stored=… duration=…ms stored_at=…`.
 
-`StoredAt` содержит shortID подтвердивших (8 hex-символов) — это
+`StoredAt` содержит shortID подтвердивших (8 hex-символов). Это
 используется в `scripts/store_experiment.sh`, чтобы убить именно
 хранителя.
 
-**Важно:** на этапе 3 (Шаг 7.5) `Put` был исправлен так, чтобы
-владелец **всегда** клал запись локально. Раньше это происходило
-только если self попадал в `candidates`, что при `selectReplicas`
-исключено. Без этого исправления `republish` не мог продлить TTL:
-после истечения исходной записи у владельца не оставалось источника.
+**Важно (Е3-4).** Владелец **всегда** кладёт запись локально
+(`LocalStored=true`), если она прошла `Validate`. Но `Replicas`,
+`Acks` и `StoredAt` считаются по трём ближайшим по XOR. Если владелец
+**не** в тройке, `StoredAt` его не содержит, а `Replicas`/`Acks`
+отражают только тройку. Это семантика из ТЗ §10.1: «репликация на
+`R = 3` ближайших к ключу доступных узлах». Раньше владелец всегда
+считался одной из реплик, что нарушало XOR-выбор и завышало `Acks`
+для ключей, далёких от владельца. Покрыто
+`TestPutOwnerLocalEvenIfNotInReplicaSet` (лог: `owner in replica
+set: false (storedAt=3 replicas=3 acks=3 N=20 K=4)`).
+
+Если `Lookup` падает, а локальный `Put` прошёл — `Put` возвращает
+`(res, nil)` с `Success=false`; запись у владельца есть,
+`republish` продолжает работать. Если локальный `Put` тоже упал —
+возвращается ошибка.
 
 ### 8.4. Чтение (`Get`)
 
 `node.Get(ctx, key)`:
 
-1. проверяет локальное хранилище;
-2. иначе — `dht.FindValue.Run`;
-3. при находке кладёт запись в локальное хранилище (кэширование на
-   пути) и возвращает её;
-4. возвращает `(nil, false, nil)`, если запись не найдена.
+1. `local, hasLocal := n.store.Get(key)`;
+2. если `TableSize() == 0` — возвращает `local` (fallback для
+   одиночного узла);
+3. иначе — всегда `dht.FindValue.Run` (локальная копия не перекрывает
+   удалённую);
+4. если `res.Success && res.Record != nil`: `res.Record.Validate(
+   time.Now(), nil)`; при успехе — `n.store.Put(res.Record)` и возврат
+   `res.Record`, **если** `res.Record.SequenceNumber >=
+   local.SequenceNumber`;
+5. если `hasLocal` — возвращает `local` (fallback);
+6. иначе — `(nil, false, nil)`.
+
+**Важно (Е3-2).** Раньше `node.Get` возвращал локальную копию
+«слепо», не проверяя, не устарела ли она. Это приводило к тому, что
+хранитель старой версии возвращал её приложению, даже если в DHT уже
+лежала более новая. Теперь `Get` идёт в `FindValue`, а локальная
+копия используется только как fallback. Покрыто
+`TestAliasLastWriterWins` (лог: `source=remote node=c2`),
+`TestPutThenGetAcrossNodes` (`source=remote`),
+`TestGetRejectsExpiredRemoteRecord`.
 
 ### 8.5. Переопубликование (`republish`)
 
@@ -704,9 +749,17 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 3. `Sign(n.id.Priv)`;
 4. `Put(ctx, fresh)`.
 
+`republish` **не зависит от кворума**: `Put` кладёт запись локально
+первым (`LocalStored=true`), и `cloneForRepublish` обновляет
+`SequenceNumber` локально даже при `Success=false`. Это важно при
+малом `N` (например, `N=2`): тройка ближайших по XOR может содержать
+только `self`, `Acks=1 < 2`, `Success=false`, но `SequenceNumber`
+увеличен и TTL продлён. Покрыто `TestRepublishExtendsTTL`
+(лог: `replicas=1 acks=1 success=false local_stored=true`, но запись
+жива через 5 секунд).
+
 Без пересборки записи `ExpiresAt` остался бы прежним, и запись
 истекла бы в исходный момент, несмотря на периодические публикации.
-Это исправлено на Шаге 7.5 и покрыто `TestRepublishExtendsTTL`.
 
 ### 8.6. Очистка (`expire`)
 
@@ -728,9 +781,10 @@ oldContact, err)`. При `addressChanged=true` `node.observe`:
 
 1. `NormalizeAlias(rawAlias)`;
 2. `store.AliasKey(normalized)`;
-3. `Get(ctx, key)`.
+3. `Get(ctx, key)` — идёт в `FindValue`, локальная устаревшая копия
+   не перекрывает удалённую (см. §8.4).
 
-Ограничения псевдонимов зафиксированы в `docs/NodeRecord.md` §10–§11:
+Ограничения псевдонимов зафиксированы в `docs/Node record.md` §10–§11:
 локальный last-writer-wins, отсутствие глобальной согласованности,
 отсутствие защиты от захвата.
 
@@ -862,6 +916,15 @@ reader'ов (`BASE_PORT`, `BASE_PORT+1`, `BASE_PORT+2`), а не один.
 `all bootstrap peers failed`, и `Get` не выполнялся бы вовсе
 (`rpcs=0`). Три адреса устраняют эту проблему.
 
+**Важно (Е3-4 + `multi-seed`).** В `multi-seed` seed-узлы —
+`node-01..node-04` (при `SEEDS=4`). `store_experiment.sh` исключает
+из жертв только `node-01`, поэтому жертвой может стать другой
+seed-узел (`node-02..node-04`). Это одновременно отказ seed-узла и
+хранителя; цепочка seed-ов рвётся, и часть reader'ов не доходит до
+живых хранителей. Это ограничение модели `multi-seed`, а не дефект
+`FIND_VALUE`; на `star`, `ring`, `tree` seed только `node-01`,
+поэтому victim 100%. Подробнее — в `docs/sprints/3.md` §10.3 и §11.2.
+
 ---
 
 ## 10. Развёртывание
@@ -899,12 +962,13 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 любом нераспарсенном `SETI_*` (`SETI_ALPHA=abc`,
 `SETI_LISTEN_PORT=70000`, `SETI_BOOTSTRAP_PEERS` без порта,
 `SETI_BOOTSTRAP_PEERS=127.0.0.1:abc`, `SETI_TTL_SECONDS=abc`,
-`SETI_K_BUCKET_SIZE=abc`, `SETI_WRITE_TIMEOUT_MS=abc`). Затем
-`Config.Validate()` проверяет диапазоны (`alpha >= 1`,
-`k_bucket_size >= 1`, `ttl_seconds >= 2`, `write_timeout_ms > 0`,
-`max_frame_payload ∈ (0, 65536]`, `node_id_bits == 256`,
-`protocol_version == 1`, непустые `bootstrap_peers[i].host` и
-ненулевые порты).
+`SETI_K_BUCKET_SIZE=abc`, `SETI_WRITE_TIMEOUT_MS=abc`). Адреса в
+`SETI_BOOTSTRAP_PEERS` проходят через `netutil.ValidateHostPort`
+(IPv4, IPv6 в скобках, hostname). Затем `Config.Validate()` проверяет
+диапазоны (`alpha >= 1`, `k_bucket_size >= 1`, `ttl_seconds >= 2`,
+`write_timeout_ms > 0`, `max_frame_payload ∈ (0, 65536]`,
+`node_id_bits == 256`, `protocol_version == 1`, непустые
+`bootstrap_peers[i].host` и ненулевые порты).
 
 Готовые конфигурации для экспериментов генерируются скриптами
 `demo.sh`, `lookup.sh`, `bootstrap_schemes.sh`,
@@ -931,6 +995,15 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | Нет защиты от Sybil | За пределами этапов 1–3 | DHT не защищена от массового заполнения bucket |
 | Нет NAT traversal | Не входит в этапы 1–3 | Работает только в loopback/LAN |
 | Нет туннелей | Этап 5 | Прикладные данные не передаются |
+| `multi-seed` при `KILL_REPLICA=1` | Жертвой может стать seed-узел (`node-02..node-04`) | Цепочка seed-ов рвётся; victim 15/25 (60%) — ограничение модели, не дефект `FIND_VALUE` |
+
+**IPv6 поддерживается на этапах 1–3.** Адреса в `NodeRecord.Addresses`,
+`ContactWire.Host` и `bootstrap_peers` — `host:port`, где `host` —
+IPv4-литерал, IPv6-литерал **в квадратных скобках** (`[::1]:9101`)
+или RFC 1123 hostname. Нормализация через `netutil.ValidateHostPort`:
+IPv4 → `net.IP.To4().String()`, IPv6 → каноническая форма RFC 5952 в
+скобках, hostname → lowercase. «Почти IPv4» (`127.000.000.001`,
+`127.0.0.256`) отклоняется. `SelfContact` обрабатывает `::` → `::1`.
 
 Эти ограничения **не являются дефектами**: они соответствуют
 границам этапов, зафиксированным в ТЗ.
@@ -947,7 +1020,7 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
   шум в тайминги.
 - **Случайность `NodeID`.** Каждый прогон генерирует новые ключи,
   поэтому структура XOR-распределения меняется. Это учтено: серии
-  делаются на 30 наблюдений, выводы формулируются статистически.
+  делаются на 50 наблюдений, выводы формулируются статистически.
 - **`Put` с `acks < 2`.** В 20-узловой сети часть `Put` не набирает
   два подтверждения из-за таймаутов или неудачного выбора
   кандидатов. Такие записи остаются только у владельца и не
@@ -959,6 +1032,11 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
   `Put` для ключа не набрал `acks >= 2`, `stored_at` содержит только
   владельца, и сценарий не находит второго хранителя для убийства.
   В этом случае скрипт печатает `WARNING: no replica found to kill`.
+- **`multi-seed` при `KILL_REPLICA=1`.** Жертвой может стать
+  seed-узел (`node-02..node-04`), что одновременно является отказом
+  seed и хранителя. Это снижает victim до 60% в `multi-seed`, но не
+  до нуля; `non_victim` остаётся 96%. Ограничение зафиксировано в
+  §11.1 и `docs/sprints/3.md` §10.3.
 - **`TestBackgroundLRUCheckLimited`** использует «немой» TCP-listener
   и синтетический контакт (`NodeID` от `b`, порт от listener'а),
   чтобы `pingContact` не завершался мгновенно. Это тестовая
@@ -972,7 +1050,7 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 
 - Сравнение схем bootstrap при одинаковых `N`, `k`, `ALPHA`,
   таймаутах контролирует один фактор.
-- Серии на 30 наблюдений позволяют видеть распределение, а не
+- Серии на 50 наблюдений позволяют видеть распределение, а не
   отдельные наблюдения.
 - Сырые данные сохраняются в `results/<sprint>/` для воспроизводимости.
 - Автоматическая проверка невырожденности (`check_non_degenerate.sh`)
@@ -983,6 +1061,10 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
   чтобы отказ одного хранителя не блокировал bootstrap.
 - `stored_at` в логе `Put` позволяет убивать именно хранителя, а не
   случайный узел, что делает сценарий E3-5 контролируемым.
+- `node.Get` идёт в `FindValue`, локальная копия используется как
+  fallback — устраняет устаревшие локальные версии.
+- `Stop()` дожидается `bgWG` перед `SaveToDisk()` — снимок содержит
+  последние изменения.
 
 ---
 
@@ -1000,6 +1082,7 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | Ed25519 долговременная идентичность | Стандарт, stdlib, короткие ключи |
 | `NodeID = SHA-256(DER SPKI)` | Самодостаточный canonical encoding |
 | Сверка `priv.Public()` с загруженным `pub` при `load` | Узел не может объявлять одну identity и подписывать другой |
+| `netutil.ValidateHostPort` (IPv4 + IPv6 + hostname) | Единая валидация адресов для `store` и `config`; IPv6 поддерживается в скобках |
 | 256 фиксированных bucket | Детерминированная структура, простой экспорт |
 | LRU с PING перед вытеснением | Соответствие спецификации Kademlia |
 | `sync.Mutex` в `RoutingTable` | Потокобезопасность при параллельных lookup |
@@ -1015,19 +1098,24 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | `write_timeout_ms` + `WriteFrameWithDeadline` | Узел не зависает на клиенте, который перестал читать |
 | Учёт активных соединений (`Node.conns`, `connWG`) | `Stop()` закрывает соединения и ждёт обработчики |
 | `baseCtx`/`cancel` + `watchCtx` | Отмена контекста закрывает listener и соединения |
+| `bgWG` + порядок `cancel → bgWG.Wait → closeConns → connWG.Wait → SaveToDisk` | Снимок содержит последние изменения от фоновых публикаций |
 | Seed как bootstrap, а не каталог | Децентрализация |
 | Схемы `star`/`ring`/`tree`/`multi-seed` — только начальное подключение | Разделение bootstrap-графа и underlay |
 | Seed self-lookup для `multi-seed` | Связность графа seed-узлов |
 | `check_non_degenerate.sh` с `exit 2` при неполном наборе дампов | Защита от ложного PASS |
 | `bootstrap_schemes.sh` + `compare_bootstrap_schemes.sh` | Артефакты по каждой схеме, сводная таблица в `results/2/` |
 | Кодек изолирован в `protocol` | Замена формата без переписывания |
-| Канонизация `NodeRecord` построчная | Детерминизм, читаемость, простота тестов |
+| Канонизация `NodeRecord` построчная, адреса нормализуются | Детерминизм при IPv4/IPv6/hostname |
 | Домен-разделитель `seti-p2p/record/v1` | Защита от переиспользования подписи |
 | `alias` в `CanonicalBytes` только при непустом значении | Отсутствие лишних байтов, стабильность подписи |
-| `R = 3`, `StoreAckThreshold = 2` | Требование ТЗ, баланс между доступностью и стоимостью |
-| Владелец всегда кладёт запись локально | Источник для `republish`, устойчивость к отказу всех удалённых хранителей |
+| `R = 3` — три ближайших по XOR | Требование ТЗ §10.1 |
+| `LocalStored` отдельно от `Replicas`/`Acks` | Владелец хранит локально для `republish`, но не считается репликой, если не в тройке |
+| `StoreAckThreshold = 2` | Баланс между доступностью и стоимостью |
+| `Put` кладёт локально первым | `republish` не зависит от кворума, TTL продлевается при `N=1..2` |
 | `republish` пересобирает запись | Продление TTL, иначе `ExpiresAt` не сдвигается |
 | `FIND_VALUE` добирает до `k` ответивших | Возможность найти более новую версию у другого хранителя |
+| `Validate(now, nil)` в `FindValue`, `handleFindValue`, `node.Get` | Истёкшая/битая/устаревшая запись не возвращается приложению |
+| `node.Get` всегда идёт в `FindValue` (если `TableSize() > 0`) | Локальная устаревшая копия не перекрывает удалённую |
 | `BuildSelfRecordWithSeq` для тестов | Детерминированный `SequenceNumber` без `time.Sleep` |
 | Локальный last-writer-wins по `sequence_number` | Без консенсуса — единственный практичный вариант |
 | Отсутствие глобальной согласованности | Осознанное ограничение модели (ТЗ §11.1) |
@@ -1061,13 +1149,15 @@ IP-достижимостью (несколько Docker-сетей, `nftables`)
 | Артефакты bootstrap-схем | §9.6 |
 | Развёртывание и конфигурация без правки кода | §10 |
 | Валидация конфигурации и env | §10.3 |
-| `NodeRecord` с канонизацией и подписью | §8.1, `docs/NodeRecord.md` |
+| IPv4, IPv6, hostname в адресах | §11.1, §12 (`netutil`) |
+| `NodeRecord` с канонизацией и подписью | §8.1, `docs/Node record.md` |
 | `STORE` / `FIND_VALUE` | §8.3, §8.4 |
-| Репликация `R = 3`, `acks >= 2` | §8.3 |
+| Репликация `R = 3` — три ближайших по XOR | §8.3 |
 | TTL и защита от отката | §8.2, §8.5 |
 | Переопубликование владельцем | §8.5 |
 | Псевдонимы с нормализацией | §8.7 |
 | Отказ хранителя | §8.3, §11.2 |
+| `Stop()` сохраняет итоговое состояние | §3.3, §8.5, §12 |
 | Ограничения модели | §11 |
 | Расширяемость под TUNNEL/APP | §2, §14 |
 

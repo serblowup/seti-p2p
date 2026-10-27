@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"seti-p2p/internal/identity"
+	"seti-p2p/internal/netutil"
 )
 
 const (
@@ -45,7 +46,14 @@ type NodeRecord struct {
 }
 
 func (r *NodeRecord) CanonicalBytes() []byte {
-	addrs := append([]string(nil), r.Addresses...)
+	addrs := make([]string, 0, len(r.Addresses))
+	for _, a := range r.Addresses {
+		if norm, err := netutil.ValidateHostPort(a); err == nil {
+			addrs = append(addrs, norm)
+		} else {
+			addrs = append(addrs, a)
+		}
+	}
 	sort.Strings(addrs)
 
 	var b strings.Builder
@@ -190,13 +198,13 @@ func (r *NodeRecord) Validate(now time.Time, prev *NodeRecord) error {
 }
 
 func validateAddress(a string) error {
-	host, port, ok := strings.Cut(a, ":")
-	if !ok || host == "" || port == "" {
-		return fmt.Errorf("%w: bad address %q", ErrRecordInvalid, a)
+	norm, err := netutil.ValidateHostPort(a)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRecordInvalid, err)
 	}
-	p, err := strconv.Atoi(port)
-	if err != nil || p <= 0 || p > 65535 {
-		return fmt.Errorf("%w: bad port in %q", ErrRecordInvalid, a)
+	if norm != a {
+		return fmt.Errorf("%w: address not normalized: got %q want %q",
+			ErrRecordInvalid, a, norm)
 	}
 	return nil
 }

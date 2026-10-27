@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"seti-p2p/internal/protocol"
 	"seti-p2p/internal/routing"
@@ -64,7 +65,7 @@ func (n *Node) handleFindValue(f *protocol.Frame) (*protocol.Frame, error) {
 	}
 
 	if rec, ok := n.store.Get(req.Key); ok {
-		if verr := rec.Verify(); verr != nil {
+		if verr := rec.Validate(time.Now(), nil); verr != nil {
 			log.Printf("node %s: dropping invalid stored record key=%s: %v",
 				shortID(n.nodeID), shortID(req.Key), verr)
 		} else {
@@ -101,4 +102,8 @@ func (n *Node) handleFindValue(f *protocol.Frame) (*protocol.Frame, error) {
 
 func (n *Node) PutLocal(rec *store.NodeRecord) error {
 	return n.store.Put(rec)
+}
+
+func (n *Node) PutLocalUnchecked(rec *store.NodeRecord) {
+	n.store.PutUnchecked(rec)
 }

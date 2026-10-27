@@ -31,13 +31,14 @@ func findByID(contacts []routing.Contact, id []byte) bool {
 	return false
 }
 
-func newTestCluster(t *testing.T, basePort uint16, nClients int) (*node.Node, []*node.Node) {
+func newTestCluster(t *testing.T, basePort uint16, nClients int, kBucket int) (*node.Node, []*node.Node) {
 	t.Helper()
 
 	seedCfg := config.Default()
 	seedCfg.StateDir = t.TempDir()
 	seedCfg.ListenHost = "127.0.0.1"
 	seedCfg.ListenPort = basePort
+	seedCfg.KBucketSize = kBucket
 
 	seed, err := node.New(seedCfg)
 	if err != nil {
@@ -55,6 +56,7 @@ func newTestCluster(t *testing.T, basePort uint16, nClients int) (*node.Node, []
 		c.StateDir = t.TempDir()
 		c.ListenHost = "127.0.0.1"
 		c.ListenPort = basePort + 1 + uint16(i)
+		c.KBucketSize = kBucket
 		c.BootstrapPeers = []config.Contact{{Host: "127.0.0.1", Port: basePort}}
 
 		nd, err := node.New(c)
@@ -73,15 +75,18 @@ func newTestCluster(t *testing.T, basePort uint16, nClients int) (*node.Node, []
 	return seed, clients
 }
 
-func TestBootstrapAndLookup(t *testing.T) {
-	const basePort = 19301
-	const nClients = 4
+func runBootstrapAndLookup(t *testing.T, basePort uint16, nClients int, kBucket int, allowSkip bool) {
+	t.Helper()
 
-	seed, clients := newTestCluster(t, basePort, nClients)
+	seed, clients := newTestCluster(t, basePort, nClients, kBucket)
 	_ = seed
 
+	convergenceTimeout := 2 * time.Second
+	if nClients >= 15 {
+		convergenceTimeout = 6 * time.Second
+	}
 	for _, c := range clients {
-		waitForConvergence(c, 2, 2*time.Second)
+		waitForConvergence(c, 2, convergenceTimeout)
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -92,10 +97,10 @@ func TestBootstrapAndLookup(t *testing.T) {
 			if i == j {
 				continue
 			}
-			nearest := c.TableNearest(other.NodeID(), 100)
+			nearest := c.TableNearest(other.NodeID(), nClients)
 			if !findByID(nearest, other.NodeID()) {
 				initiator = c
-				target = other.NodeID()
+				target = append([]byte(nil), other.NodeID()...)
 				break
 			}
 		}
@@ -105,8 +110,13 @@ func TestBootstrapAndLookup(t *testing.T) {
 	}
 
 	if initiator == nil {
-		t.Skip("no pair with target absent from initiator's table; " +
-			"small N makes this likely — full check via scripts/lookup.sh")
+		if allowSkip {
+			t.Skipf("no pair with target absent from initiator's table "+
+				"(N=%d, K=%d); small N makes this likely — full check via "+
+				"advanced subtest or scripts/lookup.sh", nClients+1, kBucket)
+		}
+		t.Fatalf("non-degeneracy violated: every node knows every other "+
+			"at N=%d, K=%d", nClients+1, kBucket)
 	}
 
 	res, err := initiator.Lookup(context.Background(), target)
@@ -124,16 +134,42 @@ func TestBootstrapAndLookup(t *testing.T) {
 	if !findByID(res.Closest, target) {
 		t.Fatal("target not in closest after lookup")
 	}
+	if nClients+1 >= 15 && res.RPCs < 2 {
+		t.Fatalf("advanced-level lookup must be multi-hop (>=2 RPCs), got %d", res.RPCs)
+	}
 
-	t.Logf("lookup succeeded: rpcs=%d iters=%d closest=%d",
-		res.RPCs, res.Iterations, len(res.Closest))
+	t.Logf("lookup succeeded: N=%d K=%d rpcs=%d iters=%d closest=%d",
+		nClients+1, kBucket, res.RPCs, res.Iterations, len(res.Closest))
+}
+
+func TestBootstrapAndLookup(t *testing.T) {
+	cases := []struct {
+		name     string
+		basePort uint16
+		nClients int
+		kBucket  int
+		short    bool
+		skipOK   bool
+	}{
+		{"smoke_N5_K3", 19301, 4, 3, false, true},
+		{"advanced_N20_K4", 21301, 19, 4, true, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.short && testing.Short() {
+				t.Skip("advanced-level network (N=20, K=4) skipped in -short mode")
+			}
+			runBootstrapAndLookup(t, tc.basePort, tc.nClients, tc.kBucket, tc.skipOK)
+		})
+	}
 }
 
 func TestSeedFailureDoesNotBlockLookup(t *testing.T) {
 	const basePort = 19401
 	const nClients = 4
 
-	seed, clients := newTestCluster(t, basePort, nClients)
+	seed, clients := newTestCluster(t, basePort, nClients, 3)
 	seedID := append([]byte(nil), seed.NodeID()...)
 
 	waitForConvergence(clients[0], 3, 3*time.Second)

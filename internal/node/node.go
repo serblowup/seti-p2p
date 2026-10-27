@@ -43,8 +43,9 @@ type Node struct {
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
 	connWG  sync.WaitGroup
+	bgWG    sync.WaitGroup
 
-	lruCheckSem      chan struct{}
+	lruCheckSem       chan struct{}
 	lruChecksInFlight int32
 }
 
@@ -89,6 +90,10 @@ func (n *Node) TableNearest(target []byte, k int) []routing.Contact {
 	return n.table.Nearest(target, k)
 }
 
+func (n *Node) TableSnapshot() []routing.BucketSnapshot {
+	return n.table.Snapshot()
+}
+
 func (n *Node) StoreSize() int { return n.store.Size() }
 
 func (n *Node) StoreGet(key []byte) (*store.NodeRecord, bool) {
@@ -105,8 +110,11 @@ func (n *Node) SelfContact() (routing.Contact, error) {
 		return routing.Contact{}, err
 	}
 	host := n.cfg.ListenHost
-	if host == "" || host == "0.0.0.0" || host == "::" {
+	switch host {
+	case "", "0.0.0.0":
 		host = "127.0.0.1"
+	case "::":
+		host = "::1"
 	}
 	return routing.Contact{
 		NodeID:            n.nodeID,
@@ -157,9 +165,6 @@ func (n *Node) watchCtx(ctx context.Context, ln net.Listener) {
 
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
-		if err := n.store.SaveToDisk(); err != nil {
-			log.Printf("node %s: save dht-store: %v", shortID(n.nodeID), err)
-		}
 		n.mu.Lock()
 		cancel := n.cancel
 		ln := n.ln
@@ -170,8 +175,12 @@ func (n *Node) Stop() {
 		if ln != nil {
 			_ = ln.Close()
 		}
+		n.bgWG.Wait()
 		n.closeConns()
 		n.connWG.Wait()
+		if err := n.store.SaveToDisk(); err != nil {
+			log.Printf("node %s: save dht-store: %v", shortID(n.nodeID), err)
+		}
 	})
 }
 

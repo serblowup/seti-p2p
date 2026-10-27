@@ -1,0 +1,13 @@
+scheme=multi-seed nodes=20 runs=50 ok=39
+killed_replica=node-02 key=ac390036
+victim_key=ac390036 reads=25 success=15
+non_victim_reads=25 non_victim_success=24
+
+raw CSV: results/3/multi-seed-store.csv
+
+aggregates
+successful runs: 39
+avg rpcs:        7.95
+avg iters:       2.74
+avg duration:    1.41 ms
+median duration: 2.00 ms

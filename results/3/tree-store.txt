@@ -1,0 +1,13 @@
+scheme=tree nodes=20 runs=50 ok=50
+killed_replica=node-03 key=5e4f4af0
+victim_key=5e4f4af0 reads=26 success=26
+non_victim_reads=24 non_victim_success=24
+
+raw CSV: results/3/tree-store.csv
+
+aggregates
+successful runs: 50
+avg rpcs:        7.12
+avg iters:       2.56
+avg duration:    1.12 ms
+median duration: 1.00 ms

@@ -1,0 +1,13 @@
+scheme=star nodes=20 runs=50 ok=49
+killed_replica=node-03 key=f12e7620
+victim_key=f12e7620 reads=27 success=27
+non_victim_reads=23 non_victim_success=22
+
+raw CSV: results/3/star-store.csv
+
+aggregates
+successful runs: 49
+avg rpcs:        7.02
+avg iters:       2.49
+avg duration:    1.20 ms
+median duration: 1.00 ms

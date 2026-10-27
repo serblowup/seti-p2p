@@ -221,6 +221,26 @@ func TestFindValueResponseRoundTripWithRecord(t *testing.T) {
 	if err := got.Record.Verify(); err != nil {
 		t.Fatalf("signature broken: %v", err)
 	}
+	if got.Record.IssuedAt != rec.IssuedAt {
+		t.Fatalf("IssuedAt mismatch: got %d want %d", got.Record.IssuedAt, rec.IssuedAt)
+	}
+	if got.Record.ExpiresAt != rec.ExpiresAt {
+		t.Fatalf("ExpiresAt mismatch: got %d want %d", got.Record.ExpiresAt, rec.ExpiresAt)
+	}
+	if got.Record.SequenceNumber != rec.SequenceNumber {
+		t.Fatalf("SequenceNumber mismatch: got %d want %d", got.Record.SequenceNumber, rec.SequenceNumber)
+	}
+	if len(got.Record.Addresses) != len(rec.Addresses) {
+		t.Fatalf("Addresses length mismatch: got %d want %d", len(got.Record.Addresses), len(rec.Addresses))
+	}
+	for i := range rec.Addresses {
+		if got.Record.Addresses[i] != rec.Addresses[i] {
+			t.Fatalf("Addresses[%d] mismatch: got %q want %q", i, got.Record.Addresses[i], rec.Addresses[i])
+		}
+	}
+	if got.Record.Alias != rec.Alias {
+		t.Fatalf("Alias mismatch: got %q want %q", got.Record.Alias, rec.Alias)
+	}
 }
 
 func TestFindValueResponseRoundTripWithContacts(t *testing.T) {

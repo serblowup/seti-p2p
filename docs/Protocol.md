@@ -26,8 +26,9 @@ Kademlia, алгоритм итеративного поиска узлов и �
 | **Lookup** | Итеративный поиск узлов, ближайших к целевому `NodeID`, через DHT RPC |
 | **RPC** | Запрос прикладного протокола и соответствующий ему ответ, связанные полем `request_id` |
 | **NodeRecord** | Подписанная адресная запись владельца `NodeID`, хранящаяся в DHT (см. `docs/Node record.md`) |
-| **STORE** | Операция публикации `NodeRecord` на `R = 3` ближайших к ключу узлах |
+| **STORE** | Операция публикации `NodeRecord` на `R = 3` ближайших к ключу по XOR узлах |
 | **FIND_VALUE** | Операция поиска `NodeRecord` по DHT-ключу |
+| **LocalStored** | Флаг того, что владелец положил запись в свой `store` локально; не считается репликой, если владелец не в тройке ближайших по XOR |
 
 В общей loopback/Docker bridge-сети все узлы IP-достижимы друг для друга.
 В этом случае схемы `star`, `ring`, `tree`, `multi-seed` являются
@@ -82,21 +83,35 @@ Kademlia, алгоритм итеративного поиска узлов и �
 
 Каждое входящее соединение регистрируется в `Node.conns`
 (`map[net.Conn]struct{}`) и учитывается в `Node.connWG`
-(`sync.WaitGroup`). `Stop()`:
+(`sync.WaitGroup`). Фоновые горутины (`republishLoop`, `expireLoop`)
+учитываются в `Node.bgWG` (`sync.WaitGroup`).
+
+`Stop()`:
 
 1. вызывает `cancel()` на `baseCtx` (отмена контекста закрывает
-   listener и соединения через `watchCtx`);
+   listener и соединения через `watchCtx`, останавливает фоновые
+   горутины);
 2. закрывает listener;
-3. вызывает `closeConns()` — закрывает все активные соединения;
-4. ждёт `connWG` — завершения всех `handleConn`.
+3. вызывает `bgWG.Wait()` — дожидается завершения `republishLoop` и
+   `expireLoop`;
+4. вызывает `closeConns()` — закрывает все активные соединения;
+5. ждёт `connWG` — завершения всех `handleConn`;
+6. вызывает `SaveToDisk()` — сохраняет **итоговое** состояние
+   хранилища.
+
+Такой порядок гарантирует, что снимок хранилища содержит последние
+изменения от фоновых публикаций. Покрыто `TestStopSavesFinalStoreState`.
 
 Отмена контекста без `Stop()` также закрывает listener и соединения
-через `watchCtx` (`<-ctx.Done()`, `ln.Close()`, `closeConns()`).
+через `watchCtx` (`<-ctx.Done()`, `ln.Close()`, `closeConns()`), но
+**не** вызывает `SaveToDisk()`. Для штатного завершения используется
+`Stop()`.
+
 Проверяется `TestStopClosesActiveConnections`,
 `TestStopWaitsForHandlers`, `TestStopClosesManyActiveConnections`,
 `TestStopDuringActiveHandler`, `TestStartCancelClosesListener`,
 `TestStartCancelClosesActiveConnections`, `TestStopCancelsContext`,
-`TestHandleConnClosesOnWriteError`.
+`TestHandleConnClosesOnWriteError`, `TestStopSavesFinalStoreState`.
 
 ---
 
@@ -233,6 +248,10 @@ MessagePack и CBOR выполнено в том же документе с чи
 в миллисекундах Unix. `timestamp_ms` эхом возвращается в `PONG`
 и проверяется инициатором.
 
+`host` может быть IPv4-литералом, IPv6-литералом **в скобках**
+(`[::1]`) или RFC 1123 hostname. Нормализация — `netutil.ValidateHostPort`
+(§7.4).
+
 #### 6.3.2. `PONG`
 
 ```json
@@ -280,7 +299,7 @@ XOR-расстояния до цели. Контакт отправителя и
   "record": {
     "node_id": "<32 байта>",
     "identity_public_key": "<DER SPKI>",
-    "addresses": ["127.0.0.1:9101"],
+    "addresses": ["127.0.0.1:9101", "[::1]:9101"],
     "sequence_number": 1730000000000,
     "issued_at": 1730000000,
     "expires_at": 1730000180,
@@ -291,8 +310,10 @@ XOR-расстояния до цели. Контакт отправителя и
 ```
 
 `record` — `NodeRecord` (см. `docs/Node record.md`). Поле `alias`
-опционально. Получатель проверяет `record.Validate(now, prev)` и
-возвращает `Stored=true` либо `Stored=false` с текстом ошибки.
+опционально. `addresses` содержит нормализованные `host:port`, где
+`host` — IPv4-литерал, IPv6-литерал в скобках или RFC 1123 hostname.
+Получатель проверяет `record.Validate(now, prev)` и возвращает
+`Stored=true` либо `Stored=false` с текстом ошибки.
 
 #### 6.3.6. `STORE_RESPONSE`
 
@@ -321,7 +342,9 @@ XOR-расстояния до цели. Контакт отправителя и
 ```
 
 `key` — DHT-ключ: `SHA-256("node:" || NodeID)` или
-`SHA-256("alias:" || normalized)`.
+`SHA-256("alias:" || normalized)`. `key` неверной длины отклоняется
+`handleFindValue` с `ERROR` на уровне кадра (`find_value key must be
+32 bytes`).
 
 #### 6.3.8. `FIND_VALUE_RESPONSE`
 
@@ -347,6 +370,13 @@ XOR-расстояния до цели. Контакт отправителя и
 
 `record` и `contacts` взаимоисключающие: если `record` есть,
 `contacts` пуст, и наоборот.
+
+Запись в `record` **обязана** проходить `Validate(time.Now(), nil)` на
+стороне инициатора (`dht.FindValue.Run`) и получателя
+(`handleFindValue`). Истёкшая, с будущим `issued_at`, с плохими
+адресами или ненормализованным alias запись **не принимается**:
+инициатор игнорирует её, получатель заменяет на `contacts` и логирует
+`dropping invalid stored record`.
 
 #### 6.3.9. `ERROR`
 
@@ -406,8 +436,7 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 
 - оба файла есть — `load`;
 - только один есть — ошибка `identity.key exists but identity.pub missing`
-  или наоборот (раньше при наличии только `identity.pub` узел
-  генерировал новую пару и затирал старый `identity.pub`);
+  или наоборот;
 - оба отсутствуют — генерация новой пары.
 
 Покрыто `TestIdentityLoadRejectsMismatchedKeys`,
@@ -427,14 +456,27 @@ NodeID = SHA-256(canonical_encode(identity_public_key))
 - `SHA-256(canonical_encode(public_key))` совпадает с `node_id`;
 - `host` не пуст, `port` не равен нулю.
 
+`host` нормализуется через `netutil.ValidateHostPort`:
+
+- IPv4-литерал → каноническая форма `net.IP.To4().String()`
+  (убирает ведущие нули; `127.000.000.001` отклоняется как
+  «почти IPv4», а не как hostname);
+- IPv6-литерал **в скобках** → каноническая форма RFC 5952 в скобках
+  (`[0:0:0:0:0:0:0:1]` → `[::1]`); unbracketed IPv6 (`::1:9101`)
+  отклоняется;
+- hostname → lowercase по RFC 1123.
+
+Реализация: `internal/netutil/addr.go` (`ValidateHostPort`),
+`internal/routing/contact.go` (`FromWire`).
+
+Покрыто 9 `TestFromWire*` (accept valid, bad DER, NodeID mismatch,
+mismatched key+NodeID, short/long NodeID, bad algorithm, empty host,
+zero port), а также `tests/unit/netutil_test.go`
+(`TestValidateHostPort*`).
+
 После проверки `FromWire` устанавливает `LastSeenMs = now`
 (локальное время приёма). `LastVerifiedMs` остаётся нулевым до
 первого успешного `PONG`.
-
-Реализация: `internal/routing/contact.go`, функция `FromWire`.
-Покрыто 9 `TestFromWire*` (accept valid, bad DER, NodeID mismatch,
-mismatched key+NodeID, short/long NodeID, bad algorithm, empty host,
-zero port).
 
 ### 7.5. Ограничения модели идентичности
 
@@ -460,10 +502,10 @@ zero port).
 4. `len(Signature) == 64`;
 5. `ed25519.Verify(pub, CanonicalBytes(), Signature)`.
 
-`Validate(now, prev)` дополнительно проверяет TTL, адреса,
-нормализацию alias и монотонность `sequence_number`. Подробности
-канонического представления и жизненного цикла записи см.
-`docs/Node record.md`.
+`Validate(now, prev)` дополнительно проверяет TTL, адреса
+(через `netutil.ValidateHostPort`), нормализацию alias и монотонность
+`sequence_number`. Подробности канонического представления и
+жизненного цикла записи см. `docs/Node record.md`.
 
 ---
 
@@ -478,7 +520,7 @@ zero port).
 | `node_id` | `[]byte`, 32 байта | `NodeID` владельца |
 | `identity_algorithm` | string | Всегда `"ed25519"` |
 | `identity_public_key` | `[]byte` | DER SPKI публичного ключа |
-| `host` | string | Хост, по которому доступен узел |
+| `host` | string | IPv4-литерал, IPv6-литерал в скобках (`[::1]`) или RFC 1123 hostname |
 | `port` | uint16 | TCP-порт |
 
 ### 8.2. Локальные поля
@@ -699,6 +741,10 @@ listener'а), чтобы `pingContact` не завершался мгновен�
 - `SETI_LISTEN_PORT=x` или `SETI_LISTEN_PORT=70000` (вне `0..65535`);
 - `SETI_BOOTSTRAP_PEERS` без порта (`127.0.0.1`) или с битым портом
   (`127.0.0.1:abc`).
+
+Адреса в `SETI_BOOTSTRAP_PEERS` проходят через
+`netutil.ValidateHostPort`: поддерживаются IPv4, IPv6 в скобках,
+RFC 1123 hostname; «почти IPv4» и мусор отклоняются.
 
 Затем `Config.Validate()` проверяет:
 
@@ -996,6 +1042,15 @@ non-empty bucket.
 seed-узел убивается, и повторный lookup выполняется между двумя
 другими узлами.
 
+**Важно (Е3-4 + `multi-seed`).** В `multi-seed` seed-узлы —
+`node-01..node-04` (при `SEEDS=4`). `scripts/store_experiment.sh`
+исключает из жертв только `node-01`, поэтому жертвой может стать
+другой seed-узел (`node-02..node-04`). Это одновременно отказ
+seed-узла и хранителя; цепочка seed-ов рвётся, и часть reader'ов не
+доходит до живых хранителей. Это ограничение модели `multi-seed`,
+а не дефект `FIND_VALUE`; на `star`, `ring`, `tree` seed только
+`node-01`, поэтому victim 100%. Подробнее — `docs/sprints/3.md` §10.3.
+
 ### 15.7. Проверка невырожденности и артефакты
 
 `scripts/check_non_degenerate.sh` проверяет три критерия:
@@ -1038,33 +1093,62 @@ buckets 2.70–2.95.
 `Node.Put(ctx, rec)`:
 
 1. `rec.Key()` — DHT-ключ;
-2. `n.Lookup(ctx, key)` — до `k` ближайших к ключу узлов;
-3. `selectReplicas(self, closest, R-1)` — до `R-1 = 2` удалённых
-   кандидатов (self считается отдельно);
-4. `store.Put(rec)` — владелец всегда пытается положить запись
-   локально; при ошибке `Validate` (истёкший TTL, откат
-   `sequence_number`, плохой адрес) запись у него не сохраняется,
-   и владелец не считается выбранным хранителем в `Replicas`;
-5. параллельные `STORE_REQUEST` двум удалённым кандидатам;
+2. `n.store.Put(rec)` — **первым**, до `Lookup`;
+   `res.LocalStored = (localErr == nil)`. Локальная копия ведётся для
+   `republishLoop` и `SaveToDisk`, **не** считается репликой, если
+   владелец не попал в тройку ближайших по XOR;
+3. `n.Lookup(ctx, key)` — до `k` ближайших к ключу узлов;
+4. `selectReplicasByXOR(lookupRes.Closest, R)` — до `R = 3` ближайших
+   по XOR, **включая владельца, если он в тройке**;
+5. параллельные `STORE_REQUEST` выбранным репликам; для `self` в
+   тройке — `Acks++` только если локальный `Put` прошёл;
 6. `Success = acks >= StoreAckThreshold` (`StoreAckThreshold = 2`);
-7. журнал `store put key=… replicas=… acks=… success=… duration=…ms stored_at=…`.
+7. журнал `store put key=… replicas=… acks=… success=… local_stored=… duration=…ms stored_at=…`.
 
 `stored_at` содержит shortID подтвердивших (8 hex-символов). Это
 используется в `scripts/store_experiment.sh`, чтобы убить именно
 хранителя, а не случайный узел.
 
+**Семантика (Е3-4):**
+
+- `Replicas` — число выбранных хранителей из тройки ближайших по XOR
+  (до `R = 3`).
+- `Acks` — число подтвердивших среди выбранных; если владелец в
+  тройке и его локальный `Put` прошёл, он даёт одно подтверждение.
+- `LocalStored` — владелец положил запись локально (для `republish`
+  и локального кэша); **не** входит в `Acks`/`Replicas`, если
+  владелец не в тройке.
+- `StoredAt` — контакты подтвердивших.
+
+Если владелец **не** в тройке, `StoredAt` его не содержит, но
+`LocalStored=true` и запись у владельца в `store`. Это используется
+`republishLoop` и `SaveToDisk`.
+
+Если `Lookup` падает, а локальный `Put` прошёл — `Put` возвращает
+`(res, nil)` с `Success=false`; запись у владельца есть, `republish`
+продолжает работать. Если локальный `Put` тоже упал — возвращается
+ошибка.
+
 ### 16.2. Чтение записи (`Get`)
 
 `Node.Get(ctx, key)`:
 
-1. проверяет локальное хранилище;
-2. иначе — итеративный `FIND_VALUE` (`internal/dht/find_value.go`);
-3. `FindValue` не останавливается на первой найденной записи: он
+1. `local, hasLocal := n.store.Get(key)`;
+2. если `TableSize() == 0` — возвращает `local` (fallback для
+   одиночного узла);
+3. иначе — **всегда** итеративный `FIND_VALUE`
+   (`internal/dht/find_value.go`); локальная копия не перекрывает
+   удалённую;
+4. `FindValue` не останавливается на первой найденной записи: он
    добирает до `k` **ответивших**, чтобы обнаружить более новую
-   версию у другого хранителя;
-4. возвращает найденную валидную запись с **наибольшим**
-   `sequence_number` из собранных. При равенстве `sequence_number`
-   возвращается первая найденная.
+   версию у другого хранителя; каждая найденная запись проходит
+   `Validate(time.Now(), nil)` — истёкшая, с будущим `issued_at`,
+   с плохими адресами или ненормализованным alias **не принимается**;
+5. возвращает найденную валидную запись с **наибольшим**
+   `sequence_number` из собранных, если
+   `res.Record.SequenceNumber >= local.SequenceNumber`;
+6. если `hasLocal` — возвращает `local` (fallback);
+7. иначе — `(nil, false, nil)`.
 
 `FindValue.Run` использует ту же структуру `candidateSet`
 (`byID` / `responded` / `failed`) и то же условие остановки по
@@ -1072,6 +1156,14 @@ buckets 2.70–2.95.
 с полями `Key`, `Success`, `Record`, `Closest`, `RPCs`, `Iterations`,
 `Timeouts`, `Responded`, `DurationMs`, `Trace`, `Discovered`.
 `node.Get` обрабатывает `Discovered` через `observeAsync`.
+
+**Важно (Е3-2).** Раньше `Get` возвращал локальную копию «слепо»,
+не проверяя, не устарела ли она. Это приводило к тому, что хранитель
+старой версии возвращал её приложению, даже если в DHT уже лежала
+более новая. Теперь `Get` идёт в `FindValue`, а локальная копия
+используется только как fallback. Покрыто `TestAliasLastWriterWins`
+(лог: `source=remote node=c2`), `TestPutThenGetAcrossNodes`
+(`source=remote`), `TestGetRejectsExpiredRemoteRecord`.
 
 ### 16.3. Обработка `STORE_REQUEST`
 
@@ -1104,15 +1196,17 @@ buckets 2.70–2.95.
 Получив `FIND_VALUE_REQUEST`, узел:
 
 1. декодирует payload строго;
-2. проверяет длину `key` (ровно 32 байта);
+2. проверяет длину `key` (ровно 32 байта). Неверная длина —
+   `ERROR` на уровне кадра (`find_value key must be 32 bytes`);
 3. проверяет контакт отправителя;
 4. обрабатывает контакт отправителя через `observeAsync`;
 5. если `key` есть в локальном хранилище — **повторно проверяет
-   `rec.Verify()`** перед возвратом (защита в глубину: `Store.Put`
-   уже проверяет подпись, но если запись попала в хранилище в
-   обход `Put` или была скомпрометирована, хранитель её не
-   отдаёт; при провале `Verify()` запись логируется как
-   `dropping invalid stored record` и клиент получает `contacts`);
+   `rec.Validate(time.Now(), nil)`** перед возвратом (защита в
+   глубину: `Store.Put` уже проверяет подпись, но если запись
+   попала в хранилище в обход `Put` или была скомпрометирована,
+   хранитель её не отдаёт; при провале `Validate` запись
+   логируется как `dropping invalid stored record` и клиент
+   получает `contacts`);
 6. иначе — возвращает до `k_bucket_size` ближайших известных
    контактов к `key` (как в `FIND_NODE_RESPONSE`), исключив
    отправителя и локальный узел.
@@ -1131,6 +1225,13 @@ buckets 2.70–2.95.
 обновляются `IssuedAt`, `ExpiresAt`, `SequenceNumber`, затем
 переподписывается. Без пересборки `ExpiresAt` остался бы прежним,
 и запись истекла бы в исходный момент.
+
+`republish` **не зависит от кворума**: `Put` кладёт запись локально
+первым (`LocalStored=true`), и `cloneForRepublish` обновляет
+`SequenceNumber` локально даже при `Success=false`. Это важно при
+малом `N` (например, `N=2`): тройка ближайших по XOR может содержать
+только `self`, `Acks=1 < 2`, `Success=false`, но `SequenceNumber`
+увеличен и TTL продлён.
 
 Раз в 30 секунд `expireLoop` вызывает `store.DeleteExpired()` и
 логирует `store expired removed=N`.
@@ -1158,7 +1259,8 @@ buckets 2.70–2.95.
 
 1. нормализует псевдоним;
 2. вычисляет `AliasKey(normalized)`;
-3. вызывает `Get(ctx, key)`.
+3. вызывает `Get(ctx, key)` — идёт в `FindValue`, локальная
+   устаревшая копия не перекрывает удалённую (см. §16.2).
 
 Для теста `TestAliasLastWriterWins` добавлен
 `Node.BuildSelfRecordWithSeq(seq uint64)`: строит запись через
@@ -1195,6 +1297,17 @@ buckets 2.70–2.95.
 версии 1 спроектирован так, чтобы их добавление не требовало
 изменения формата кадра.
 
+**IPv6 поддерживается на этапах 1–3** (в скобках, `[::1]:9101`), но
+IPv4-mapped IPv6 (`::ffff:127.0.0.1`) нормализуется в IPv4. Это
+осознанно: один адрес — одно представление. Unbracketed IPv6
+(`::1:9101`) отклоняется.
+
+**`multi-seed` при `KILL_REPLICA=1`.** Жертвой может стать seed-узел
+(`node-02..node-04`), что одновременно является отказом seed и
+хранителя. Это ограничение модели `multi-seed`, а не дефект
+`FIND_VALUE`; на `star`, `ring`, `tree` seed только `node-01`,
+поэтому victim 100%. Подробнее — `docs/sprints/3.md` §10.3.
+
 ---
 
 ## 18. Соответствие требованиям ТЗ этапов 1–3
@@ -1212,6 +1325,7 @@ buckets 2.70–2.95.
 | Сверка `pub`/`priv` при `load` | §7.3 |
 | Ed25519, хранение ключей в state_dir | §7.1 |
 | Формат контакта | §8 |
+| IPv4, IPv6, hostname в адресах | §7.4, §8.1, §11 (`netutil`) |
 | Локальные метки времени | §8.2 |
 | XOR-метрика | §9 |
 | k-bucket с ёмкостью `k`, LRU-порядок | §10.1, §10.2 |
@@ -1235,12 +1349,16 @@ buckets 2.70–2.95.
 | Валидация конфигурации и env | §11 |
 | `NodeRecord` с каноническим представлением и подписью | §7.6, §16 |
 | `STORE` / `FIND_VALUE` | §16 |
-| Репликация `R = 3`, `acks >= 2` | §16.1 |
+| Репликация `R = 3` — три ближайших по XOR | §16.1 |
+| Локальная копия владельца отдельно (`LocalStored`) | §16.1 |
 | Отказ хранителя | §16.2 |
 | TTL и защита от отката | §16.3, §16.5 |
 | Переопубликование владельцем | §16.5 |
 | Псевдонимы с нормализацией | §16.6 |
+| `Stop()` сохраняет итоговое состояние | §3.4, §16.5 |
 | Ограничения этапа 3 (нет TLS, нет глобальной согласованности) | §7.5, §17 |
+| IPv6 в скобках, IPv4-mapped нормализуется в IPv4 | §17 |
+| `multi-seed` при `KILL_REPLICA=1` — ограничение модели | §15.6, §17 |
 
 ---
 
@@ -1251,6 +1369,7 @@ buckets 2.70–2.95.
 | Транспорт | `internal/transport/conn.go`, `internal/transport/client.go` |
 | Протокол | `internal/protocol/frame.go`, `internal/protocol/messages.go`, `internal/protocol/codec.go`, `internal/protocol/altcodecs.go` |
 | Идентичность | `internal/identity/identity.go` |
+| Адреса | `internal/netutil/addr.go` |
 | Маршрутизация | `internal/routing/contact.go`, `internal/routing/distance.go`, `internal/routing/bucket.go`, `internal/routing/table.go` |
 | DHT lookup | `internal/dht/lookup.go`, `internal/dht/find_value.go` |
 | Формат записи | `internal/store/record.go` |

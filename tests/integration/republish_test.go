@@ -92,3 +92,77 @@ func TestRepublishExtendsTTL(t *testing.T) {
 			beforeSeq, after.SequenceNumber)
 	}
 }
+
+func TestStopSavesFinalStoreState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires real time sleep")
+	}
+
+	stateDir := t.TempDir()
+
+	cfg1 := config.Default()
+	cfg1.StateDir = stateDir
+	cfg1.ListenHost = "127.0.0.1"
+	cfg1.ListenPort = 19911
+	cfg1.TTLSeconds = 4
+
+	n1, err := node.New(cfg1)
+	if err != nil {
+		t.Fatalf("node New (first): %v", err)
+	}
+	ctx := context.Background()
+	if err := n1.Start(ctx); err != nil {
+		t.Fatalf("node Start (first): %v", err)
+	}
+
+	rec, err := n1.BuildSelfRecord()
+	if err != nil {
+		t.Fatalf("BuildSelfRecord: %v", err)
+	}
+	if err := n1.PutLocal(rec); err != nil {
+		t.Fatalf("PutLocal: %v", err)
+	}
+	key, err := rec.Key()
+	if err != nil {
+		t.Fatalf("Key: %v", err)
+	}
+
+	initial, ok := n1.StoreGet(key)
+	if !ok {
+		t.Fatal("record must be present right after PutLocal")
+	}
+	initialSeq := initial.SequenceNumber
+
+	time.Sleep(3 * time.Second)
+
+	afterRepublish, ok := n1.StoreGet(key)
+	if !ok {
+		t.Fatal("record must still be present after republish")
+	}
+	if afterRepublish.SequenceNumber <= initialSeq {
+		t.Fatalf("republish did not increment SequenceNumber: initial=%d after=%d",
+			initialSeq, afterRepublish.SequenceNumber)
+	}
+	expectedSeq := afterRepublish.SequenceNumber
+
+	n1.Stop()
+
+	n2, err := node.New(cfg1)
+	if err != nil {
+		t.Fatalf("node New (second): %v", err)
+	}
+	if err := n2.Start(ctx); err != nil {
+		t.Fatalf("node Start (second): %v", err)
+	}
+	defer n2.Stop()
+
+	loaded, ok := n2.StoreGet(key)
+	if !ok {
+		t.Fatal("record not found on disk after restart: final state was not saved")
+	}
+	if loaded.SequenceNumber != expectedSeq {
+		t.Fatalf("disk has stale record: got seq=%d, want %d "+
+			"(snapshot was taken before background republish finished)",
+			loaded.SequenceNumber, expectedSeq)
+	}
+}

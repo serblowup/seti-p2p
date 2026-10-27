@@ -91,7 +91,7 @@ func (fv *FindValue) Run(ctx context.Context, key []byte) FindValueResult {
 			trace.Responded = append(trace.Responded, r.peer.NodeID)
 			res.Responded++
 			if r.rec != nil {
-				if err := r.rec.Verify(); err == nil {
+				if verr := r.rec.Validate(time.Now(), nil); verr == nil {
 					if res.Record == nil || r.rec.SequenceNumber > res.Record.SequenceNumber {
 						res.Record = r.rec
 						res.Success = true

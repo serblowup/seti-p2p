@@ -16,7 +16,7 @@
 
 - для разрешения `NodeID` в актуальный `host:port`;
 - для разрешения псевдонима в `NodeID`;
-- как единица репликации (`R = 3` ближайших к ключу узлов);
+- как единица репликации (`R = 3` ближайших по XOR к ключу узлов);
 - как объект, для которого обязательны проверка подписи, TTL и
   защита от отката версии.
 
@@ -41,6 +41,24 @@
 - `MaxAliasLen = 64`;
 - `MaxClockSkewSec = 60` — допустимое опережение `issued_at`.
 
+**Формат `addresses`.** `host:port`, где `host` — IPv4-литерал,
+IPv6-литерал **в квадратных скобках** (`[::1]:9101`) или RFC 1123
+hostname. Нормализация выполняется `netutil.ValidateHostPort`:
+
+- IPv4 приводится к канонической форме `net.IP.To4().String()`
+  (убирает ведущие нули: `127.000.000.001` → **отклоняется** как
+  «почти IPv4», а не как hostname);
+- IPv6 приводится к канонической форме `net.IP.String()`
+  (RFC 5952: `0:0:0:0:0:0:0:1` → `::1`) и оборачивается в скобки;
+- hostname приводится к нижнему регистру (DNS регистронезависим);
+- порт — десятичный `1..65535`.
+
+`Validate` требует, чтобы `addresses` в записи были **уже
+нормализованы**: `netutil.ValidateHostPort(a) == a`. Это аналог
+требования к `alias` и защищает `CanonicalBytes` от неоднозначности
+(`[::1]:9101` и `[0:0:0:0:0:0:0:1]:9101` — семантически один адрес,
+но разные строки; без нормализации подпись бы различалась).
+
 ---
 
 ## 3. Каноническое представление
@@ -64,9 +82,10 @@ alias=<normalized>
 
 1. Первая строка — домен-разделитель `RecordVersion`. Это защищает
    подпись от переиспользования в другом контексте.
-2. `addresses` сортируются лексикографически **перед** формированием
-   канонических байтов. Порядок в самом `NodeRecord.Addresses` может
-   быть любым, но подпись от него не зависит.
+2. Каждый адрес нормализуется через `netutil.ValidateHostPort` и
+   сортируется лексикографически **перед** формированием канонических
+   байтов. Порядок в самом `NodeRecord.Addresses` может быть любым,
+   но подпись от него не зависит.
 3. `alias` присутствует в каноническом представлении только если
    он непустой. Пустой `alias` не порождает строку `alias=`.
 4. `signature` в каноническое представление **не входит**.
@@ -104,7 +123,7 @@ alias=<normalized>
 
 1. `Verify()`;
 2. `len(Addresses) > 0` и `len(Addresses) <= MaxAddresses`;
-3. каждый адрес — `host:port` с непустым host и портом в `[1, 65535]`;
+3. каждый адрес — `netutil.ValidateHostPort(a) == a` (уже нормализован);
 4. если `Alias != ""`: `NormalizeAlias(Alias) == Alias`, иначе —
    `ErrRecordInvalid`. Это защищает от записи с ненормализованным
    псевдонимом: `Key()` дал бы другой DHT-ключ, чем ожидает
@@ -158,19 +177,41 @@ alias=<normalized>
 Владелец вызывает `Put(ctx, rec)`:
 
 1. `rec.Key()` — DHT-ключ;
-2. `Lookup(ctx, key)` — до `k` ближайших узлов;
-3. `selectReplicas(self, closest, R-1)` — до двух удалённых кандидатов;
-4. `store.Put(rec)` — владелец всегда **пытается** положить запись
-   локально; при ошибке `Validate` (истёкший TTL, откат
-   `sequence_number`, плохой адрес) запись у него не сохраняется,
-   и владелец не считается выбранным хранителем в `Replicas`;
-5. параллельные `STORE_REQUEST` двум удалённым кандидатам;
+2. `n.store.Put(rec)` — **первым**, до `Lookup`;
+   `res.LocalStored = (localErr == nil)`. Локальная копия ведётся для
+   `republishLoop` и `SaveToDisk`, **не** считается репликой, если
+   владелец не попал в тройку ближайших по XOR;
+3. `Lookup(ctx, key)` — до `K` ближайших;
+4. `selectReplicasByXOR(lookupRes.Closest, R)` — до `R = 3` ближайших
+   по XOR, **включая владельца, если он в тройке**;
+5. параллельные `STORE_REQUEST` выбранным репликам; для `self` в
+   тройке — `Acks++` только если локальный `Put` прошёл;
 6. `Success = acks >= StoreAckThreshold` (`StoreAckThreshold = 2`);
-7. журнал `store put key=… replicas=… acks=… success=… stored_at=…`.
+7. журнал `store put key=… replicas=… acks=… success=… local_stored=… duration=…ms stored_at=…`.
 
 `stored_at` содержит shortID подтвердивших (8 hex-символов) —
 используется в `scripts/store_experiment.sh`, чтобы убить именно
 хранителя.
+
+**Семантика (Е3-4):**
+
+- `Replicas` — число выбранных хранителей из тройки ближайших по XOR
+  (до `R = 3`).
+- `Acks` — число подтвердивших среди выбранных; если владелец в
+  тройке и его локальный `Put` прошёл, он даёт одно подтверждение.
+- `LocalStored` — владелец положил запись локально (для `republish`
+  и локального кэша); **не** входит в `Acks`/`Replicas`, если
+  владелец не в тройке.
+- `StoredAt` — контакты подтвердивших.
+
+Если владелец **не** в тройке, `StoredAt` его не содержит, но
+`LocalStored=true` и запись у владельца в `store`. Это используется
+`republishLoop` и `SaveToDisk`.
+
+Если `Lookup` падает, а локальный `Put` прошёл — `Put` возвращает
+`(res, nil)` с `Success=false`; запись у владельца есть, `republish`
+продолжает работать. Если локальный `Put` тоже упал — возвращается
+ошибка.
 
 **`sequence_number`:**
 
@@ -186,14 +227,28 @@ alias=<normalized>
 
 `Get(ctx, key)`:
 
-1. проверяет локальное хранилище;
-2. иначе — итеративный `FIND_VALUE` (`internal/dht/find_value.go`);
-3. `FindValue` не останавливается на первой найденной записи: он
+1. `local, hasLocal := n.store.Get(key)`;
+2. если `TableSize() == 0` — возвращает `local` (fallback для
+   одиночного узла);
+3. иначе — **всегда** `dht.FindValue.Run` (локальная копия не
+   перекрывает удалённую);
+4. `FindValue` не останавливается на первой найденной записи: он
    добирает до `k` ближайших, чтобы обнаружить более новую версию
-   у другого хранителя;
-4. возвращает найденную валидную запись с **наибольшим**
-   `sequence_number` из собранных. При равенстве `sequence_number`
-   возвращается первая найденная.
+   у другого хранителя; каждая найденная запись проходит
+   `Validate(time.Now(), nil)` — истёкшая, с будущим `issued_at`,
+   с плохими адресами или ненормализованным alias **не принимается**;
+5. возвращает найденную валидную запись с **наибольшим**
+   `sequence_number` из собранных, если
+   `res.Record.SequenceNumber >= local.SequenceNumber`;
+6. если `hasLocal` — возвращает `local` (fallback);
+7. иначе — `(nil, false, nil)`.
+
+**Важно (Е3-2).** Раньше `Get` возвращал локальную копию «слепо»,
+не проверяя, не устарела ли она. Это приводило к тому, что хранитель
+старой версии возвращал её приложению, даже если в DHT уже лежала
+более новая. Теперь `Get` идёт в `FindValue`, а локальная копия
+используется только как fallback. Это устраняет устаревшие локальные
+версии при наличии более новых в DHT.
 
 ### 8.3. Переопубликование (`republish`)
 
@@ -207,52 +262,80 @@ alias=<normalized>
 3. `Sign(n.id.Priv)` — переподпись;
 4. `Put(ctx, fresh)` — публикация.
 
+`republish` **не зависит от кворума**: `Put` кладёт запись локально
+первым (`LocalStored=true`), и `cloneForRepublish` обновляет
+`SequenceNumber` локально даже при `Success=false`. Это важно при
+малом `N` (например, `N=2`): тройка ближайших по XOR может содержать
+только `self`, `Acks=1 < 2`, `Success=false`, но `SequenceNumber`
+увеличен и TTL продлён.
+
 Без пересборки записи `ExpiresAt` остался бы прежним, и запись
 истекла бы в исходный момент, несмотря на периодические публикации.
-Это исправлено на этапе 3 (Шаг 7.5).
 
 ### 8.4. Очистка (`expire`)
 
 Раз в 30 секунд `expireLoop` вызывает `store.DeleteExpired()` и
 логирует число удалённых записей `store expired removed=N`.
 
+### 8.5. `Stop()` и сохранение итогового состояния
+
+`Stop()`:
+
+1. `cancel()` на `baseCtx` (отменяет `acceptLoop`, `watchCtx`,
+   фоновые горутины);
+2. `ln.Close()` — закрывает listener;
+3. `bgWG.Wait()` — дожидается `republishLoop` и `expireLoop`;
+4. `closeConns()` — закрывает все активные соединения;
+5. `connWG.Wait()` — дожидается `handleConn`;
+6. `SaveToDisk()` — сохраняет **итоговое** состояние хранилища.
+
+Такой порядок гарантирует, что снимок содержит последние изменения
+от фоновых публикаций. Покрыто `TestStopSavesFinalStoreState`.
+
 ---
 
 ## 9. Репликация
 
-`R = 3` — число хранителей, включая владельца:
+`R = 3` — число хранителей, **три ближайших по XOR к ключу**:
 
-- владелец (self) — всегда, если локальный `store.Put` прошёл
-  `Validate`;
-- до `R - 1 = 2` удалённых кандидатов из `Lookup`;
+- `Lookup(key)` возвращает до `K` ближайших;
+- `selectReplicasByXOR(lookupRes.Closest, R)` возвращает до `R = 3`
+  ближайших, **включая владельца, если он в тройке**;
 - успех `Put` — при `acks >= StoreAckThreshold = 2`.
 
 **Семантика полей `StorePutResult`:**
 
 | Поле | Смысл |
 |---|---|
-| `Replicas` | Число **выбранных** хранителей, включая владельца (владелец считается выбранным, **если локальный `store.Put` прошёл `Validate`**; при ошибке локального `Put` владелец не выбран и `Replicas` уменьшается) и до `R-1` удалённых, которым **отправлен** `STORE_REQUEST` |
-| `Acks` | Число **подтвердивших** (`Stored=true`) среди выбранных |
+| `Replicas` | Число выбранных хранителей из тройки ближайших по XOR (до `R = 3`) |
+| `Acks` | Число **подтвердивших** (`Stored=true`) среди выбранных; если владелец в тройке и его локальный `Put` прошёл, он даёт одно подтверждение |
+| `LocalStored` | Владелец положил запись локально (для `republish` и локального кэша); **не** входит в `Acks`/`Replicas`, если владелец не в тройке |
 | `StoredAt` | Контакты подтвердивших |
 
 В логе `Put`:
 
-- `replicas=` = `Replicas` — сколько хранителей выбрано, включая
-  владельца, если его локальный `store.Put` прошёл `Validate`;
-- `acks=` = `Acks` — сколько подтвердило.
+- `replicas=` = `Replicas` — сколько хранителей выбрано из тройки;
+- `acks=` = `Acks` — сколько подтвердило;
+- `local_stored=true/false` — положил ли владелец локально;
+- `stored_at=` — shortID подтвердивших.
 
-Если часть удалённых кандидатов не ответила за `ReadTimeoutMs`,
-`replicas > acks`. Если локальный `store.Put` у владельца упал,
-`Replicas` не включает владельца, и в логе это видно как
-`replicas` меньше ожидаемого `R` при `acks`, равном числу
-ответивших удалённых кандидатов. `StoredAt` содержит только
-подтвердивших: если `acks = 2` из трёх выбранных, `StoredAt`
-содержит два shortID, а `replicas=3`.
+**Важно (Е3-4).** Владелец **всегда** кладёт запись локально
+(`LocalStored=true`), если она прошла `Validate`, но `Replicas`,
+`Acks` и `StoredAt` считаются по трём ближайшим по XOR. Если владелец
+**не** в тройке, `StoredAt` его не содержит, а `Replicas`/`Acks`
+отражают только тройку. Это семантика из ТЗ §10.1: «репликация на
+`R = 3` ближайших к ключу доступных узлах».
 
-Если `acks < 2`, запись остаётся только у владельца и не считается
-опубликованной. `FIND_VALUE` с другого узла её не найдёт, если
-владелец не входит в `k` ближайших к ключу с точки зрения этого
-узла.
+Раньше владелец всегда считался одной из реплик, что нарушало
+XOR-выбор и завышало `Acks` для ключей, далёких от владельца. Теперь
+`TestPutOwnerLocalEvenIfNotInReplicaSet` подтверждает обратное:
+`owner in replica set: false (storedAt=3 replicas=3 acks=3 N=20 K=4)`.
+
+Если `acks < 2`, запись остаётся только у владельца
+(`LocalStored=true`) и не считается опубликованной. `FIND_VALUE` с
+другого узла её не найдёт, если владелец не входит в `k` ближайших
+к ключу с точки зрения этого узла. `republish` владельца частично
+компенсирует это: локальная копия обновляется каждые `TTL/2`.
 
 ---
 
@@ -266,9 +349,10 @@ alias=<normalized>
 3. проверка `rec.Alias == ""` — нельзя перезаписывать уже
    подписанное поле;
 4. `rec.Validate(time.Now(), nil)` — проверка подписи, TTL, адресов
-   до переподписи. `prev=nil`: rollback по `sequence_number`
-   проверит `Put` на каждом хранителе. Это отклоняет мусорные
-   записи с информативной ошибкой `alias: invalid record: …`;
+   (через `netutil.ValidateHostPort`) до переподписи. `prev=nil`:
+   rollback по `sequence_number` проверит `Put` на каждом хранителе.
+   Это отклоняет мусорные записи с информативной ошибкой
+   `alias: invalid record: …`;
 5. `rec.Alias = normalized`;
 6. `rec.Sign(n.id.Priv)` — переподпись (alias входит в
    `CanonicalBytes`);
@@ -278,7 +362,8 @@ alias=<normalized>
 
 1. `NormalizeAlias(rawAlias)`;
 2. `AliasKey(normalized)` — DHT-ключ;
-3. `Get(ctx, key)`.
+3. `Get(ctx, key)` — идёт в `FindValue` (если `TableSize() > 0`),
+   локальная устаревшая копия не перекрывает удалённую (см. §8.2).
 
 Ограничения:
 
@@ -297,11 +382,20 @@ alias=<normalized>
   применяет `store.Put` и хранит ту версию, которую получил последней
   с большим `sequence_number`. Глобальной согласованности нет: если
   конкурирующие публикации дошли до разных подмножеств хранителей,
-  `Get` вернёт ту версию, которую отдаст первый ответивший хранитель.
+  `Get` вернёт ту версию, которую отдаст первый ответивший хранитель
+  с наибольшим `sequence_number`.
 - **Нет anti-entropy.** Если `Put` не дошёл до какого-то хранителя,
   у него останется старая версия или ничего. `republish` владельца
   частично компенсирует это, но не гарантирует согласованности.
 - **Нет анонимности.** `NodeID` и адреса передаются в открытом виде.
+- **IPv6 поддерживается** (`[addr]:port`), но **без** IPv4-mapped
+  IPv6 (`::ffff:127.0.0.1`) — `net.ParseIP` вернёт IPv4-mapped
+  адрес, `To4()` не nil, и адрес нормализуется в IPv4. Это
+  осознанно: один адрес — одно представление.
+- **`multi-seed` при `KILL_REPLICA=1`.** Жертвой может стать
+  seed-узел (`node-02..node-04`), что одновременно является отказом
+  seed и хранителя. Это ограничение модели `multi-seed`, а не
+  дефект `FIND_VALUE`; подробнее — `docs/sprints/3.md` §10.3.
 
 ---
 
@@ -329,14 +423,39 @@ alias=<normalized>
   `TestValidateRejectsControlCharInAlias`,
   `TestValidateAcceptsNormalizedAlias`).
 
+Тесты `tests/unit/netutil_test.go` фиксируют:
+
+- IPv4-литералы и нормализацию ведущих нулей
+  (`TestValidateHostPortIPv4`);
+- IPv6-литералы в скобках и нормализацию в RFC 5952
+  (`TestValidateHostPortIPv6`);
+- отклонение IPv6 без скобок (`TestValidateHostPortIPv6Unbracketed`);
+- hostname и приведение к нижнему регистру
+  (`TestValidateHostPortHostname`);
+- отклонение «почти IPv4» (`127.000.000.001`, `127.0.0.256`),
+  мусора, пустых строк, битых портов
+  (`TestValidateHostPortRejects`).
+
 Интеграционные тесты:
 
 - `tests/integration/store_test.go` — `STORE`/`FIND_VALUE` на
-  двух-трёх узлах;
-- `tests/integration/dht_ops_test.go` — `Put`/`Get`, отказ реплики,
-  `TestPutThenGetAcrossNodes`, `TestGetAfterReplicaFailure`,
-  `TestPutReplicasCountsOwner` (семантика `Replicas`);
-- `tests/integration/alias_test.go` — псевдонимы, last-writer-wins,
-  отклонение чужой записи, `TestPutAliasRejectsInvalidRecord`,
+  двух-трёх узлах; `TestFindValueDropsInvalidStoredRecord`
+  (битая подпись в локальном хранилище → `handleFindValue` отдаёт
+  `contacts`, не запись);
+- `tests/integration/dht_ops_test.go` — `Put`/`Get` на `N = 20, K = 4`,
+  отказ реплики, `TestPutThenGetAcrossNodes` (`source=remote`),
+  `TestGetAfterReplicaFailure`, `TestPutReplicasByXOR`,
+  `TestPutOwnerLocalEvenIfNotInReplicaSet` (`owner in replica set:
+  false`), `TestGetRejectsExpiredRemoteRecord`;
+- `tests/integration/alias_test.go` — псевдонимы, last-writer-wins
+  (`source=remote node=c2`), отклонение чужой записи,
+  `TestPutAliasRejectsInvalidRecord`,
   `TestPutAliasRejectsInvalidAddress`;
-- `tests/integration/republish_test.go` — `TestRepublishExtendsTTL`.
+- `tests/integration/republish_test.go` — `TestRepublishExtendsTTL`
+  (при `N=2`: `replicas=1 acks=1 success=false local_stored=true`,
+  но TTL продлён), `TestStopSavesFinalStoreState` (при `N=1`:
+  `replicas=0 acks=0 success=false local_stored=true`, снимок
+  содержит новую версию после `Stop`);
+- `tests/unit/find_value_validation_test.go` —
+  `TestFindValueRejectsExpiredRemoteRecord` (`FindValue` не
+  принимает истёкшую запись от удалённого хранителя).

@@ -92,6 +92,19 @@ func (s *Store) Put(rec *NodeRecord) error {
 	return nil
 }
 
+func (s *Store) PutUnchecked(rec *NodeRecord) {
+	if rec == nil {
+		return
+	}
+	key, err := rec.Key()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records[hexKey(key)] = cloneRecord(rec)
+}
+
 func (s *Store) Get(key []byte) (*NodeRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
